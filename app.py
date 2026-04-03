@@ -32,8 +32,11 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GIST_ID = os.environ.get("GIST_ID", "bc004e07ada6586fc4492590f80b182b")
 GIST_FILE = "trade-journal.json"
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# ── Symbol mapping for multi-source APIs ──
+SYMBOL_MAP = {
+    "BTCUSDT": {"coingecko": "bitcoin", "kraken": "XBTUSD", "coincap": "bitcoin"},
+    "ETHUSDT": {"coingecko": "ethereum", "kraken": "ETHUSD", "coincap": "ethereum"},
+}
 
 POLL_INTERVAL = 30   # seconds
 RETRY_INTERVAL = 60  # seconds on API failure
@@ -180,20 +183,94 @@ def save_alerts(alerts):
     return gist_write(data)
 
 
-# ── Binance helpers ─────────────────────────────────────
+# ── Price helpers (multi-source fallback) ───────────────
+
+def _get_symbol_ids(symbol):
+    """Get API-specific IDs for a symbol."""
+    return SYMBOL_MAP.get(symbol.upper(), {
+        "coingecko": symbol.lower().replace("usdt", ""),
+        "kraken": symbol.upper().replace("USDT", "USD"),
+        "coincap": symbol.lower().replace("usdt", ""),
+    })
+
+
+def _price_coingecko(symbol):
+    """PRIMARY — CoinGecko (free, no auth, no geo restrictions)."""
+    ids = _get_symbol_ids(symbol)
+    r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                      params={"ids": ids["coingecko"], "vs_currencies": "usd"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return float(data[ids["coingecko"]]["usd"])
+
+
+def _price_kraken(symbol):
+    """BACKUP — Kraken (free, no geo restrictions)."""
+    ids = _get_symbol_ids(symbol)
+    pair = ids["kraken"]
+    r = requests.get("https://api.kraken.com/0/public/Ticker",
+                      params={"pair": pair}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("error") and len(data["error"]):
+        raise ValueError(data["error"][0])
+    # Kraken returns keys like XXBTZUSD or XBTUSD — get the first result
+    result = data["result"]
+    key = list(result.keys())[0]
+    return float(result[key]["c"][0])
+
+
+def _price_coincap(symbol):
+    """SECOND BACKUP — CoinCap (free, no geo restrictions)."""
+    ids = _get_symbol_ids(symbol)
+    r = requests.get(f"https://api.coincap.io/v2/assets/{ids['coincap']}", timeout=10)
+    r.raise_for_status()
+    return float(r.json()["data"]["priceUsd"])
+
 
 def get_price(symbol="BTCUSDT"):
-    """Get current price from Binance public API."""
-    r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=10)
-    r.raise_for_status()
-    return float(r.json()["price"])
+    """Get current price with multi-source fallback: CoinGecko → Kraken → CoinCap."""
+    sources = [
+        ("CoinGecko", _price_coingecko),
+        ("Kraken", _price_kraken),
+        ("CoinCap", _price_coincap),
+    ]
+    last_err = None
+    for name, fn in sources:
+        try:
+            price = fn(symbol)
+            logging.debug("Price from %s: %s = %s", name, symbol, price)
+            return price
+        except Exception as e:
+            logging.warning("Price fetch from %s failed: %s", name, e)
+            last_err = e
+    raise RuntimeError(f"All price sources failed for {symbol}: {last_err}")
 
 
 def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
-    """Get OHLCV candle data from Binance."""
-    r = requests.get(BINANCE_KLINES_URL, params={
-        "symbol": symbol, "interval": interval, "limit": limit
-    }, timeout=15)
+    """Get OHLCV candle data. Tries CoinGecko first, falls back to Kraken."""
+    try:
+        return _klines_coingecko(symbol, interval, limit)
+    except Exception as e:
+        logging.warning("CoinGecko klines failed: %s — trying Kraken", e)
+    try:
+        return _klines_kraken(symbol, interval, limit)
+    except Exception as e:
+        logging.warning("Kraken klines failed: %s", e)
+        raise RuntimeError(f"All kline sources failed for {symbol}: {e}")
+
+
+def _klines_coingecko(symbol, interval, limit):
+    """Fetch OHLCV from CoinGecko (free, no auth)."""
+    ids = _get_symbol_ids(symbol)
+    # Map interval to CoinGecko days parameter
+    interval_days = {
+        "3m": 1, "5m": 1, "15m": 1, "30m": 2, "1h": 4,
+        "4h": 14, "1d": limit, "1w": limit * 7, "1M": limit * 30,
+    }
+    days = min(interval_days.get(interval, limit), 365)
+    r = requests.get(f"https://api.coingecko.com/api/v3/coins/{ids['coingecko']}/ohlc",
+                      params={"vs_currency": "usd", "days": days}, timeout=15)
     r.raise_for_status()
     candles = []
     for k in r.json():
@@ -203,9 +280,39 @@ def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
             "high": float(k[2]),
             "low": float(k[3]),
             "close": float(k[4]),
-            "volume": float(k[5]),
+            "volume": 0,  # CoinGecko OHLC doesn't include volume
         })
-    return candles
+    return candles[-limit:]  # trim to requested limit
+
+
+def _klines_kraken(symbol, interval, limit):
+    """Fetch OHLCV from Kraken (free, no geo restrictions)."""
+    ids = _get_symbol_ids(symbol)
+    # Map interval to Kraken minutes
+    interval_map = {
+        "1m": 1, "3m": 5, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "4h": 240, "1d": 1440, "1w": 10080, "1M": 21600,
+    }
+    kraken_interval = interval_map.get(interval, 1440)
+    r = requests.get("https://api.kraken.com/0/public/OHLC",
+                      params={"pair": ids["kraken"], "interval": kraken_interval}, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("error") and len(data["error"]):
+        raise ValueError(data["error"][0])
+    result = data["result"]
+    key = [k for k in result.keys() if k != "last"][0]
+    candles = []
+    for k in result[key]:
+        candles.append({
+            "time": datetime.fromtimestamp(float(k[0]), tz=timezone.utc).isoformat(),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[6]),
+        })
+    return candles[-limit:]
 
 
 # ── Telegram helper ─────────────────────────────────────
