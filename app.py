@@ -38,8 +38,9 @@ SYMBOL_MAP = {
     "ETHUSDT": {"coingecko": "ethereum", "kraken": "ETHUSD", "coincap": "ethereum"},
 }
 
-POLL_INTERVAL = 30   # seconds
+POLL_INTERVAL = 60   # seconds — reduced from 30 to avoid rate limits
 RETRY_INTERVAL = 60  # seconds on API failure
+CACHE_TTL = 45       # seconds — serve cached price if fresher than this
 
 # ── Trading system document (embedded for AI prompt) ───
 TRADING_SYSTEM = r"""
@@ -183,7 +184,12 @@ def save_alerts(alerts):
     return gist_write(data)
 
 
-# ── Price helpers (multi-source fallback) ───────────────
+# ── Price helpers (multi-source with cache + rate limit tracking) ──
+
+# Cache: { symbol: { "price": float, "time": float } }
+_price_cache = {}
+# Per-source cooldown: { source_name: earliest_retry_time }
+_source_cooldown = {}
 
 def _get_symbol_ids(symbol):
     """Get API-specific IDs for a symbol."""
@@ -194,70 +200,113 @@ def _get_symbol_ids(symbol):
     })
 
 
-def _price_coingecko(symbol):
-    """PRIMARY — CoinGecko (free, no auth, no geo restrictions)."""
-    ids = _get_symbol_ids(symbol)
-    r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                      params={"ids": ids["coingecko"], "vs_currencies": "usd"}, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return float(data[ids["coingecko"]]["usd"])
+def _is_cooled_down(source_name):
+    """Check if a source is still in rate-limit cooldown."""
+    until = _source_cooldown.get(source_name, 0)
+    if time.time() < until:
+        return False
+    return True
+
+
+def _set_cooldown(source_name, seconds=60):
+    """Put a source on cooldown after a 429."""
+    _source_cooldown[source_name] = time.time() + seconds
+    logging.warning("%s rate limited — cooling down for %ds", source_name, seconds)
 
 
 def _price_kraken(symbol):
-    """BACKUP — Kraken (free, no geo restrictions)."""
+    """PRIMARY — Kraken (free, no rate limits on public tier)."""
     ids = _get_symbol_ids(symbol)
     pair = ids["kraken"]
     r = requests.get("https://api.kraken.com/0/public/Ticker",
                       params={"pair": pair}, timeout=10)
+    if r.status_code == 429:
+        _set_cooldown("Kraken")
+        r.raise_for_status()
     r.raise_for_status()
     data = r.json()
     if data.get("error") and len(data["error"]):
         raise ValueError(data["error"][0])
-    # Kraken returns keys like XXBTZUSD or XBTUSD — get the first result
     result = data["result"]
     key = list(result.keys())[0]
     return float(result[key]["c"][0])
 
 
 def _price_coincap(symbol):
-    """SECOND BACKUP — CoinCap (free, no geo restrictions)."""
+    """BACKUP — CoinCap (free, no geo restrictions)."""
     ids = _get_symbol_ids(symbol)
     r = requests.get(f"https://api.coincap.io/v2/assets/{ids['coincap']}", timeout=10)
+    if r.status_code == 429:
+        _set_cooldown("CoinCap")
+        r.raise_for_status()
     r.raise_for_status()
     return float(r.json()["data"]["priceUsd"])
 
 
+def _price_coingecko(symbol):
+    """SECOND BACKUP — CoinGecko (strict rate limits on free tier)."""
+    ids = _get_symbol_ids(symbol)
+    r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                      params={"ids": ids["coingecko"], "vs_currencies": "usd"}, timeout=10)
+    if r.status_code == 429:
+        _set_cooldown("CoinGecko")
+        r.raise_for_status()
+    r.raise_for_status()
+    data = r.json()
+    return float(data[ids["coingecko"]]["usd"])
+
+
 def get_price(symbol="BTCUSDT"):
-    """Get current price with multi-source fallback: CoinGecko → Kraken → CoinCap."""
+    """Get price: check cache first, then Kraken → CoinCap → CoinGecko with cooldowns."""
+    now = time.time()
+
+    # 1. Return cached price if still fresh
+    cached = _price_cache.get(symbol)
+    if cached and (now - cached["time"]) < CACHE_TTL:
+        return cached["price"]
+
+    # 2. Try sources in order, skipping any on cooldown
     sources = [
-        ("CoinGecko", _price_coingecko),
         ("Kraken", _price_kraken),
         ("CoinCap", _price_coincap),
+        ("CoinGecko", _price_coingecko),
     ]
     last_err = None
     for name, fn in sources:
+        if not _is_cooled_down(name):
+            logging.debug("Skipping %s — on cooldown", name)
+            continue
         try:
             price = fn(symbol)
-            logging.debug("Price from %s: %s = %s", name, symbol, price)
+            logging.info("Price from %s: %s = $%.2f", name, symbol, price)
+            _price_cache[symbol] = {"price": price, "time": now}
             return price
         except Exception as e:
             logging.warning("Price fetch from %s failed: %s", name, e)
             last_err = e
+
+    # 3. All sources failed — return stale cache if available
+    if cached:
+        age = int(now - cached["time"])
+        logging.warning("All sources failed — using cached price (%ds old)", age)
+        return cached["price"]
+
     raise RuntimeError(f"All price sources failed for {symbol}: {last_err}")
 
 
 def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
-    """Get OHLCV candle data. Tries CoinGecko first, falls back to Kraken."""
-    try:
-        return _klines_coingecko(symbol, interval, limit)
-    except Exception as e:
-        logging.warning("CoinGecko klines failed: %s — trying Kraken", e)
-    try:
-        return _klines_kraken(symbol, interval, limit)
-    except Exception as e:
-        logging.warning("Kraken klines failed: %s", e)
-        raise RuntimeError(f"All kline sources failed for {symbol}: {e}")
+    """Get OHLCV candle data. Tries Kraken first, falls back to CoinGecko."""
+    if _is_cooled_down("Kraken"):
+        try:
+            return _klines_kraken(symbol, interval, limit)
+        except Exception as e:
+            logging.warning("Kraken klines failed: %s — trying CoinGecko", e)
+    if _is_cooled_down("CoinGecko"):
+        try:
+            return _klines_coingecko(symbol, interval, limit)
+        except Exception as e:
+            logging.warning("CoinGecko klines failed: %s", e)
+    raise RuntimeError(f"All kline sources failed for {symbol}")
 
 
 def _klines_coingecko(symbol, interval, limit):
