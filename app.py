@@ -667,6 +667,302 @@ Do not identify noise — only what matters."""
         return jsonify({"error": f"AI analysis failed: {e}"}), 502
 
 
+# ── MT4 Integration ─────────────────────────────────────
+
+# In-memory MT4 connection state
+_mt4_status = {
+    "connected": False,
+    "last_heartbeat": None,
+    "open_trades": 0,
+    "account_balance": 0,
+    "account_equity": 0,
+}
+
+
+def get_trades():
+    """Get trades array from Gist."""
+    data = gist_read()
+    if data is None:
+        return []
+    # trades may be stored as top-level array or under "trades" key
+    if isinstance(data, list):
+        return data
+    return data.get("trades", data.get("data", []))
+
+
+def save_trades(trades_list):
+    """Save trades array back to Gist, preserving other keys."""
+    data = gist_read()
+    if data is None:
+        data = {}
+    if isinstance(data, list):
+        # Legacy format — migrate to dict
+        data = {"trades": data}
+    # Determine which key trades are stored under
+    if "data" in data and isinstance(data["data"], list):
+        data["data"] = trades_list
+    else:
+        data["trades"] = trades_list
+    return gist_write(data)
+
+
+def mt4_trade_to_journal(body):
+    """Convert MT4 trade-open payload to journal trade format."""
+    now = datetime.now(timezone.utc).isoformat()
+    entry = float(body.get("entry_price", 0))
+    sl = float(body.get("stop_loss", 0))
+    tp = float(body.get("take_profit", 0))
+    sl_dist = abs(entry - sl) if sl else 0
+    tp_dist = abs(tp - entry) if tp else 0
+    planned_rr = (tp_dist / sl_dist) if sl_dist > 0 else 0
+
+    return {
+        "id": "mt4_" + str(body.get("ticket", "")),
+        "market": "BTC/USDT" if "BTC" in body.get("symbol", "").upper() else "Forex",
+        "pair": body.get("symbol", ""),
+        "direction": body.get("direction", "Long").lower(),
+        "timeframe": "",
+        "setup": "",
+        "dateOpen": body.get("timestamp", now),
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "size": str(body.get("lot_size", "")),
+        "risk": 0,
+        "plannedRR": round(planned_rr, 2),
+        "confidence": 0,
+        "conditions": [],
+        "rationale": "",
+        "preChart": "",
+        # System analysis fields — to be filled by user
+        "htfBias": "", "poiType": "", "bosTF": "", "liqTaken": "",
+        "mbmsConfirmed": "", "scVisible": "", "entryConfirmation": "",
+        "distMomentum": "", "poiLevel": "",
+        # Status
+        "status": "open",
+        "dateClose": None, "exitPrice": None, "actualPnL": None,
+        "outcome": None, "actualRR": None,
+        "review": "", "postChart": "", "rating": 0,
+        # Post-trade review
+        "scRespected": None, "mbmsPlayedOut": None, "htfAligned": None,
+        "liqProperlyTaken": None, "expectedVsActual": "",
+        "whatDifferently": "", "lessonLearned": "", "executionRating": 0,
+        # MT4 metadata
+        "source": "mt4",
+        "mt4Ticket": body.get("ticket"),
+        "mt4Balance": body.get("account_balance"),
+        "mt4Equity": body.get("account_equity"),
+        # Meta
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+@app.route("/mt4/trade-open", methods=["POST"])
+def mt4_trade_open():
+    body = request.json
+    if not body or not body.get("ticket"):
+        return jsonify({"error": "ticket required"}), 400
+
+    trade = mt4_trade_to_journal(body)
+    trades_list = get_trades()
+    # Check if trade already exists
+    existing = [t for t in trades_list if t.get("id") == trade["id"]]
+    if existing:
+        return jsonify({"ok": True, "message": "Trade already logged"}), 200
+
+    trades_list.append(trade)
+    save_trades(trades_list)
+
+    # Telegram notification
+    direction = body.get("direction", "Long")
+    symbol = body.get("symbol", "")
+    entry = body.get("entry_price", 0)
+    sl = body.get("stop_loss", 0)
+    tp = body.get("take_profit", 0)
+    lot = body.get("lot_size", 0)
+
+    msg = (
+        f"\U0001f4ca <b>Trade opened on MT4!</b>\n\n"
+        f"<b>{symbol}</b> — {direction}\n"
+        f"\U0001f4cd Entry: <b>${entry}</b>\n"
+        f"\U0001f6d1 SL: ${sl} | \U0001f3af TP: ${tp}\n"
+        f"\U0001f4e6 Lot size: {lot}\n\n"
+        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open your journal to add your analysis!</a>"
+    )
+    send_telegram(msg)
+
+    logging.info("MT4 trade opened: #%s %s %s @ %s", body.get("ticket"), symbol, direction, entry)
+    return jsonify({"ok": True, "trade_id": trade["id"]}), 201
+
+
+@app.route("/mt4/trade-close", methods=["POST"])
+def mt4_trade_close():
+    body = request.json
+    if not body or not body.get("ticket"):
+        return jsonify({"error": "ticket required"}), 400
+
+    trade_id = "mt4_" + str(body["ticket"])
+    trades_list = get_trades()
+    found = None
+    for t in trades_list:
+        if t.get("id") == trade_id:
+            found = t
+            break
+
+    if not found:
+        return jsonify({"error": "Trade not found in journal"}), 404
+
+    # Update trade
+    exit_price = float(body.get("exit_price", 0))
+    pnl = float(body.get("profit_loss", 0))
+    entry = found.get("entry", 0)
+    sl = found.get("sl", 0)
+    sl_dist = abs(entry - sl) if sl else 0
+    exit_dist = abs(exit_price - entry)
+    actual_rr = (exit_dist / sl_dist) if sl_dist > 0 else 0
+
+    found["status"] = "closed"
+    found["exitPrice"] = exit_price
+    found["actualPnL"] = pnl
+    found["dateClose"] = body.get("timestamp", datetime.now(timezone.utc).isoformat())
+    found["actualRR"] = round(actual_rr, 2)
+
+    # Determine outcome
+    if pnl > 0:
+        found["outcome"] = "win"
+    elif pnl < 0:
+        found["outcome"] = "loss"
+    else:
+        found["outcome"] = "be"
+
+    found["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    found["mt4CloseReason"] = body.get("close_reason", "Manual close")
+    found["mt4Pips"] = body.get("pips", 0)
+    found["mt4Duration"] = body.get("duration_minutes", 0)
+
+    save_trades(trades_list)
+
+    # Telegram notification
+    symbol = body.get("symbol", found.get("pair", ""))
+    direction = body.get("direction", found.get("direction", ""))
+    outcome_emoji = "\u2705" if pnl > 0 else ("\U0001f534" if pnl < 0 else "\u2796")
+    outcome_text = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAK EVEN")
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+    msg = (
+        f"{outcome_emoji} <b>Trade closed — {outcome_text}</b>\n\n"
+        f"<b>{symbol}</b> — {direction}\n"
+        f"\U0001f4cd Entry: ${entry} \u2192 Exit: ${exit_price}\n"
+        f"\U0001f4b0 P&L: <b>{pnl_str}</b>\n"
+        f"\U0001f4ca Actual RR: 1:{actual_rr:.1f}\n"
+        f"\u23f1 Duration: {body.get('duration_minutes', 0)} min\n"
+        f"\U0001f4a1 Reason: {body.get('close_reason', 'Manual')}\n\n"
+        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal to add post-trade review!</a>"
+    )
+    send_telegram(msg)
+
+    logging.info("MT4 trade closed: #%s %s P&L=%s", body.get("ticket"), symbol, pnl_str)
+    return jsonify({"ok": True})
+
+
+@app.route("/mt4/trade-modify", methods=["POST"])
+def mt4_trade_modify():
+    body = request.json
+    if not body or not body.get("ticket"):
+        return jsonify({"error": "ticket required"}), 400
+
+    trade_id = "mt4_" + str(body["ticket"])
+    trades_list = get_trades()
+    found = None
+    for t in trades_list:
+        if t.get("id") == trade_id:
+            found = t
+            break
+
+    if not found:
+        return jsonify({"error": "Trade not found in journal"}), 404
+
+    modification = body.get("modification", "")
+    if body.get("new_sl") is not None:
+        found["sl"] = float(body["new_sl"])
+    if body.get("new_tp") is not None:
+        found["tp"] = float(body["new_tp"])
+    found["updatedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # Recalculate planned RR if TP changed
+    entry = found.get("entry", 0)
+    sl = found.get("sl", 0)
+    tp = found.get("tp", 0)
+    sl_dist = abs(entry - sl) if sl else 0
+    tp_dist = abs(tp - entry) if tp else 0
+    if sl_dist > 0:
+        found["plannedRR"] = round(tp_dist / sl_dist, 2)
+
+    save_trades(trades_list)
+
+    # Telegram for BE
+    symbol = body.get("symbol", found.get("pair", ""))
+    if "BE" in modification.upper() or "BREAK" in modification.upper():
+        potential = abs(tp - entry) * float(found.get("size", 0) or 1)
+        msg = (
+            f"\U0001f512 <b>Break even set on {symbol}!</b>\n\n"
+            f"Trade is now risk free!\n"
+            f"\U0001f3af Target still: ${tp}\n"
+            f"\U0001f4b0 Potential profit: ${potential:.2f}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">View in journal</a>"
+        )
+        send_telegram(msg)
+
+    logging.info("MT4 trade modified: #%s %s — %s", body.get("ticket"), symbol, modification)
+    return jsonify({"ok": True})
+
+
+@app.route("/mt4/status", methods=["POST", "GET"])
+def mt4_status():
+    if request.method == "POST":
+        body = request.json or {}
+        _mt4_status["connected"] = True
+        _mt4_status["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+        _mt4_status["open_trades"] = body.get("open_trades", 0)
+        _mt4_status["account_balance"] = body.get("account_balance", 0)
+        _mt4_status["account_equity"] = body.get("account_equity", 0)
+
+        # Save connection status to Gist
+        data = gist_read()
+        if data and isinstance(data, dict):
+            data["mt4_status"] = _mt4_status
+            gist_write(data)
+
+        return jsonify({"ok": True})
+
+    # GET — return status
+    return jsonify(_mt4_status)
+
+
+@app.route("/mt4/connection", methods=["GET"])
+def mt4_connection():
+    """Return MT4 connection status with staleness check."""
+    status = dict(_mt4_status)
+    if status["last_heartbeat"]:
+        last = datetime.fromisoformat(status["last_heartbeat"])
+        age = (datetime.now(timezone.utc) - last).total_seconds()
+        status["connected"] = age < 600  # 10 min timeout
+        status["seconds_ago"] = int(age)
+    else:
+        status["connected"] = False
+        status["seconds_ago"] = None
+    return jsonify(status)
+
+
+@app.route("/mt4/open-trades", methods=["GET"])
+def mt4_open_trades():
+    """Return all currently open MT4 trades from Gist."""
+    trades_list = get_trades()
+    open_trades = [t for t in trades_list if t.get("status") == "open" and t.get("source") == "mt4"]
+    return jsonify(open_trades)
+
+
 # ── Start ───────────────────────────────────────────────
 
 if __name__ == "__main__":

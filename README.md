@@ -1,14 +1,16 @@
-# Trading Alert Backend
+# POIWatcher Backend
 
-Python Flask backend for price monitoring, Telegram alerts, and AI level suggestions.
+Python Flask backend for price monitoring, Telegram alerts, AI level suggestions, and MT4 trade auto-logging.
 Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tools-/trade-log.html).
 
 ## Features
 
-- **Price Monitoring** — Checks BTCUSDT price every 30s via Binance public API
+- **Price Monitoring** — Checks BTCUSDT price every 60s via Kraken/CoinCap/CoinGecko
 - **Telegram Alerts** — Fires alerts when price crosses your levels
 - **AI Level Suggestions** — Claude analyzes candle data using your exact trading system framework
-- **Gist Storage** — Alerts stored in the same Gist as your trade journal
+- **MT4 Auto-Logging** — Expert Advisor sends trade open/close/modify events to backend
+- **Break Even Automation** — EA auto-moves SL to entry at configurable RR
+- **Gist Storage** — Alerts and trades stored in the same Gist as your trade journal
 
 ## Setup Guide
 
@@ -31,20 +33,9 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 
 ### Step 3 — Deploy to Render
 
-1. Push this `alert-backend` folder to a **new GitHub repository**
-   ```bash
-   cd alert-backend
-   git init
-   git add -A
-   git commit -m "Initial commit"
-   git remote add origin https://github.com/YOUR_USERNAME/trading-alert-backend.git
-   git push -u origin main
-   ```
-
+1. Push this repo to GitHub
 2. Go to [render.com](https://render.com) → **New Web Service**
-
 3. Connect your GitHub repo
-
 4. Add these **environment variables** in Render dashboard:
 
    | Variable | Value |
@@ -61,10 +52,50 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 ### Step 4 — Connect Journal App
 
 1. Open your Trade Journal: https://chukwuemeka001.github.io/trading-tools-/trade-log.html
-2. Go to the **Price Alerts** tab
-3. Click the **gear icon** and enter your Render backend URL (e.g. `https://trading-alert-backend.onrender.com`)
-4. Test by adding a price alert
-5. Test the AI Second Opinion button
+2. Go to the **Alerts** tab
+3. Enter your Render backend URL (e.g. `https://poiwatcher-backend.onrender.com`)
+4. Click **Save** — should show "Connected"
+5. Test by adding a price alert
+6. Test the AI Second Opinion button
+
+### Step 5 — Install MT4 Expert Advisor
+
+1. **Copy the EA file:**
+   - Copy `POIWatcher.mq4` to your MT4 installation:
+   - `C:\Users\[YOU]\AppData\Roaming\MetaQuotes\Terminal\[ID]\MQL4\Experts\`
+   - Or in MT4: File → Open Data Folder → MQL4 → Experts
+
+2. **Compile the EA:**
+   - Open MetaEditor (press F4 in MT4)
+   - File → Open → select `POIWatcher.mq4`
+   - Press F7 (Compile) — should show "0 errors"
+   - Close MetaEditor
+
+3. **Allow WebRequest:**
+   - In MT4: Tools → Options → Expert Advisors
+   - Check ✓ "Allow automated trading"
+   - Check ✓ "Allow WebRequest for listed URL"
+   - Click "Add" and enter your backend URL:
+     `https://poiwatcher-backend.onrender.com`
+   - Click OK
+
+4. **Attach to chart:**
+   - In MT4: View → Navigator (Ctrl+N)
+   - Expand "Expert Advisors"
+   - Drag "POIWatcher" onto any chart
+   - In the popup, go to **Inputs** tab:
+     - `BackendURL` — your Render URL
+     - `EnableAutoBreakEven` — true (recommended)
+     - `BreakEvenRR` — 1.5 (move SL to entry at 1:1.5 RR)
+     - `EnableAutoLogging` — true
+     - `HeartbeatMinutes` — 5
+   - Click OK
+
+5. **Verify:**
+   - Make sure the "AutoTrading" button in MT4 toolbar is ON (green)
+   - You should see a smiley face on the chart
+   - Check the Experts tab (Ctrl+E) for "POIWatcher EA initialized"
+   - In your journal app, the MT4 indicator should turn green
 
 ## API Endpoints
 
@@ -77,22 +108,34 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 | `DELETE` | `/alerts/:id` | Remove alert |
 | `GET` | `/price/:symbol` | Get current price |
 | `POST` | `/ai-levels` | Get AI level suggestions |
+| `POST` | `/mt4/trade-open` | Log new trade from MT4 EA |
+| `POST` | `/mt4/trade-close` | Log trade close from MT4 EA |
+| `POST` | `/mt4/trade-modify` | Log SL/TP modification |
+| `POST` `/GET` | `/mt4/status` | EA heartbeat |
+| `GET` | `/mt4/connection` | MT4 connection status |
+| `GET` | `/mt4/open-trades` | Currently open MT4 trades |
+
+## Architecture
+
+```
+MT4 Terminal ──→ POIWatcher EA ──→ Flask Backend ──→ Telegram Bot
+                                       │                    │
+Kraken/CoinCap ──→ Price Monitor ──────┤                    └── Your phone
+                                       │
+                                       ├── GitHub Gist (trades + alerts)
+                                       │
+                                       └── Claude API (AI levels)
+```
+
+- Backend polls Kraken every 60 seconds for price alerts
+- MT4 EA sends trade events and heartbeats to backend
+- All data syncs to GitHub Gist for the journal app
+- Telegram notifications for alerts, trade opens, closes, and break even
 
 ## Security
 
 - All credentials stored as environment variables — never hardcoded
 - CORS restricted to GitHub Pages domain only
-- Broker API keys are **never** sent to this backend — they stay in browser cookies only
+- MT4 EA communicates via HTTPS — no API keys needed for trade logging
+- Broker API keys stay in browser cookies only — never sent to backend
 - Gist token needs only `gist` scope
-
-## Architecture
-
-```
-Binance API ──→ Flask Backend ──→ Telegram Bot
-                    │                    │
-                    ├── Gist (alerts)    └── Your phone
-                    │
-                    └── Claude API (AI levels)
-```
-
-The backend runs a background thread that polls Binance every 30 seconds. When price crosses an alert level, it fires a Telegram message and marks the alert as triggered in the Gist.
