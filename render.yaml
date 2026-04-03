@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: trading-alert-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GITHUB_GIST_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GIST_ID
+        value: bc004e07ada6586fc4492590f80b182b
+      - key: ALLOWED_ORIGIN
+        value: https://chukwuemeka001.github.io
