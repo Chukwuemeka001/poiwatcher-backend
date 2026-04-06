@@ -1,6 +1,6 @@
 # POIWatcher Backend
 
-Python Flask backend for price monitoring, Telegram alerts, AI level suggestions, and MT4 trade auto-logging.
+Python Flask backend for price monitoring, Telegram alerts, AI level suggestions, MT4 trade auto-logging, and Kraken/Binance exchange integration.
 Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tools-/trade-log.html).
 
 ## Features
@@ -10,6 +10,9 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 - **AI Level Suggestions** — Claude analyzes candle data using your exact trading system framework
 - **MT4 Auto-Logging** — Expert Advisor sends trade open/close/modify events to backend
 - **Break Even Automation** — EA auto-moves SL to entry at configurable RR
+- **Kraken Exchange Integration** — Auto-log trades, monitor positions, balance tracking
+- **Binance Exchange Integration** — Same auto-logging features as Kraken (parallel option)
+- **1:5 R:R Break Even Alerts** — Telegram notification when positions reach 1:5 R:R
 - **Gist Storage** — Alerts and trades stored in the same Gist as your trade journal
 
 ## Setup Guide
@@ -31,7 +34,34 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 2. Create an API key
 3. Copy it — you'll need it for the AI level suggestion feature
 
-### Step 3 — Deploy to Render
+### Step 3 — Get Kraken API Key
+
+1. Log into [kraken.com](https://www.kraken.com)
+2. Go to **Settings → API** (or Security → API)
+3. Click **Generate New Key**
+4. Set these permissions:
+   - Query Funds — **YES**
+   - Query Open Orders & Trades — **YES**
+   - Query Closed Orders & Trades — **YES**
+   - Cancel/Close Orders — NO (not needed)
+   - Create & Modify Orders — NO (not needed)
+   - **NO withdrawal permissions needed**
+5. Copy the **API Key** and **Private Key (Secret)**
+
+### Step 4 — Get Binance API Key (Optional)
+
+1. Log into [binance.com](https://www.binance.com) (global, not .ca)
+2. Go to **API Management**
+3. Create a new API key
+4. Set permissions:
+   - Read Info — **YES**
+   - Enable Spot Trading — NO (read-only is sufficient)
+   - Enable Withdrawals — **NO** (never enable this)
+5. Copy the **API Key** and **Secret Key**
+
+> **Note:** If Binance is geo-blocked in your region, the backend will auto-detect this and fall back to Kraken only with a warning logged.
+
+### Step 5 — Deploy to Render
 
 1. Push this repo to GitHub
 2. Go to [render.com](https://render.com) → **New Web Service**
@@ -44,21 +74,24 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
    | `TELEGRAM_CHAT_ID` | Your chat ID from Step 1 |
    | `GITHUB_GIST_TOKEN` | Your GitHub PAT with `gist` scope |
    | `ANTHROPIC_API_KEY` | Your Anthropic API key from Step 2 |
+   | `KRAKEN_API_KEY` | Your Kraken API key from Step 3 |
+   | `KRAKEN_API_SECRET` | Your Kraken private key from Step 3 |
+   | `BINANCE_API_KEY` | Your Binance API key from Step 4 (optional) |
+   | `BINANCE_API_SECRET` | Your Binance secret from Step 4 (optional) |
    | `GIST_ID` | `bc004e07ada6586fc4492590f80b182b` (already set) |
    | `ALLOWED_ORIGIN` | `https://chukwuemeka001.github.io` (already set) |
 
 5. Deploy — Render will auto-detect the `render.yaml` config
 
-### Step 4 — Connect Journal App
+### Step 6 — Connect Journal App
 
 1. Open your Trade Journal: https://chukwuemeka001.github.io/trading-tools-/trade-log.html
 2. Go to the **Alerts** tab
 3. Enter your Render backend URL (e.g. `https://poiwatcher-backend.onrender.com`)
 4. Click **Save** — should show "Connected"
-5. Test by adding a price alert
-6. Test the AI Second Opinion button
+5. Exchange status indicator in the nav bar will show green when connected
 
-### Step 5 — Install MT4 Expert Advisor
+### Step 7 — Install MT4 Expert Advisor
 
 1. **Copy the EA file:**
    - Copy `POIWatcher.mq4` to your MT4 installation:
@@ -73,8 +106,8 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 
 3. **Allow WebRequest:**
    - In MT4: Tools → Options → Expert Advisors
-   - Check ✓ "Allow automated trading"
-   - Check ✓ "Allow WebRequest for listed URL"
+   - Check "Allow automated trading"
+   - Check "Allow WebRequest for listed URL"
    - Click "Add" and enter your backend URL:
      `https://poiwatcher-backend.onrender.com`
    - Click OK
@@ -114,6 +147,10 @@ Works with the [Trade Journal app](https://chukwuemeka001.github.io/trading-tool
 | `POST` `/GET` | `/mt4/status` | EA heartbeat |
 | `GET` | `/mt4/connection` | MT4 connection status |
 | `GET` | `/mt4/open-trades` | Currently open MT4 trades |
+| `GET` | `/kraken/account` | Kraken balance, orders, recent trades |
+| `GET` | `/kraken/positions` | Kraken open positions with R:R |
+| `GET` | `/binance/account` | Binance balance and open orders |
+| `GET` | `/exchange/status` | Connection status for all exchanges |
 
 ## Architecture
 
@@ -122,20 +159,29 @@ MT4 Terminal ──→ POIWatcher EA ──→ Flask Backend ──→ Telegram 
                                        │                    │
 Kraken/CoinCap ──→ Price Monitor ──────┤                    └── Your phone
                                        │
+Kraken Private ──→ Trade Auto-Logger ──┤
+Binance Private ─┘                     │
                                        ├── GitHub Gist (trades + alerts)
                                        │
                                        └── Claude API (AI levels)
 ```
 
 - Backend polls Kraken every 60 seconds for price alerts
+- Exchange sync loop checks Kraken/Binance every 60 seconds for new trades
 - MT4 EA sends trade events and heartbeats to backend
+- Open positions monitored for 1:5 R:R break even alerts
 - All data syncs to GitHub Gist for the journal app
 - Telegram notifications for alerts, trade opens, closes, and break even
 
 ## Security
 
 - All credentials stored as environment variables — never hardcoded
+- API keys and secrets are **never** logged, exported, or included in Gist data
+- API keys are **never** included in Claude AI exports or Telegram messages
 - CORS restricted to GitHub Pages domain only
 - MT4 EA communicates via HTTPS — no API keys needed for trade logging
 - Broker API keys stay in browser cookies only — never sent to backend
 - Gist token needs only `gist` scope
+- Kraken requests signed with HMAC-SHA512 per Kraken documentation
+- Binance requests signed with HMAC-SHA256 per Binance documentation
+- If API returns auth error, exchange sync is disabled automatically (no repeated bad requests)

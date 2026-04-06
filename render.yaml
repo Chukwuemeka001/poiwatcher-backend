@@ -18,3 +18,11 @@ services:
         value: bc004e07ada6586fc4492590f80b182b
       - key: ALLOWED_ORIGIN
         value: https://chukwuemeka001.github.io
+      - key: KRAKEN_API_KEY
+        sync: false
+      - key: KRAKEN_API_SECRET
+        sync: false
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
