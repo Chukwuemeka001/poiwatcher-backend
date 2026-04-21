@@ -306,6 +306,95 @@ def get_price(symbol="BTCUSDT"):
     raise RuntimeError(f"All price sources failed for {symbol}: {last_err}")
 
 
+def _get_forex_price(symbol):
+    """Fetch current FX rate for a 6-letter pair like 'EURUSD'.
+
+    Uses frankfurter.app (ECB-backed, no auth, no rate limit for our
+    volumes). Returns a mid-market rate as a float. Raises on failure;
+    callers are expected to have a fallback.
+    """
+    if not (len(symbol) == 6 and symbol.isalpha()):
+        raise ValueError(f"Not a standard 6-letter forex pair: {symbol}")
+    base  = symbol[:3].upper()
+    quote = symbol[3:].upper()
+    r = requests.get(
+        f"https://api.frankfurter.app/latest?from={base}&to={quote}",
+        timeout=5,
+    )
+    r.raise_for_status()
+    data = r.json()
+    rate = (data.get("rates") or {}).get(quote)
+    if not rate:
+        raise RuntimeError(f"No rate returned for {symbol}: {data}")
+    return float(rate)
+
+
+def _test_trade_levels(symbol, direction="BUY"):
+    """Generate realistic entry/SL/TP/lot for a synthetic pipeline test trade.
+
+    Stops are placed relative to the *current market price* so MT5 won't
+    reject with retcode 10016 (invalid stops). Falls back to sensible
+    ball-park levels if the live-price source is unreachable so the
+    pipeline test still runs when the network is flaky.
+
+    Returns (entry, sl, tp, lot).
+    """
+    sym = symbol.upper()
+    direction = direction.upper()
+
+    # ── Crypto: reuse existing multi-source get_price() ──
+    if sym in ("BTCUSDT", "ETHUSDT"):
+        try:
+            entry = get_price(sym)
+        except Exception as e:
+            logging.warning("Test-trade price fetch failed for %s: %s — using fallback", sym, e)
+            entry = 65000.0 if sym == "BTCUSDT" else 3500.0
+        if sym == "BTCUSDT":
+            stop_dist, tgt_dist = 500.0, 1500.0
+        else:  # ETHUSDT
+            stop_dist, tgt_dist = 30.0, 90.0
+        lot = 0.001
+        decimals = 2
+
+    # ── Forex: 6-letter pair via frankfurter.app ──
+    elif len(sym) == 6 and sym.isalpha():
+        try:
+            entry = _get_forex_price(sym)
+        except Exception as e:
+            logging.warning("FX test-trade price fetch failed for %s: %s — using fallback", sym, e)
+            fallbacks = {
+                "EURUSD": 1.0870, "GBPUSD": 1.2650, "AUDUSD": 0.6600,
+                "NZDUSD": 0.6000, "USDCAD": 1.3600, "USDCHF": 0.8800,
+                "USDJPY": 149.50, "EURJPY": 162.50, "GBPJPY": 189.50,
+            }
+            entry = fallbacks.get(sym, 1.0000)
+        # JPY pairs quote to 2-3 decimals (pip = 0.01); others 4-5 (pip = 0.0001)
+        pip = 0.01 if sym.endswith("JPY") else 0.0001
+        stop_dist = 50 * pip
+        tgt_dist  = 150 * pip
+        lot = 0.01
+        decimals = 3 if sym.endswith("JPY") else 5
+
+    # ── Anything else: last-ditch safe defaults ──
+    else:
+        return (1.0, 0.995, 1.015, 0.01)
+
+    # Direction-aware placement
+    if direction == "BUY":
+        sl = entry - stop_dist
+        tp = entry + tgt_dist
+    else:  # SELL — flip stops/targets
+        sl = entry + stop_dist
+        tp = entry - tgt_dist
+
+    return (
+        round(entry, decimals),
+        round(sl,    decimals),
+        round(tp,    decimals),
+        lot,
+    )
+
+
 def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
     """Get OHLCV candle data. Tries Kraken first, falls back to CoinGecko."""
     if _is_cooled_down("Kraken"):
@@ -2230,38 +2319,54 @@ def execution_test():
         return auth_err
 
     body = request.json or {}
+    symbol    = (body.get("symbol") or "EURUSD").upper()
+    direction = (body.get("direction") or "BUY").upper()
+
+    # Generate realistic levels relative to the current market price so MT5
+    # doesn't reject the order with retcode 10016 (invalid stops). Falls back
+    # to sane defaults if the live-price source is unreachable.
+    entry_live, sl_live, tp_live, lot_live = _test_trade_levels(symbol, direction)
+
+    # Explicit overrides from the request body still win (useful for targeted
+    # regression tests where the caller wants specific numbers).
+    entry = float(body.get("entry", entry_live))
+    sl    = float(body.get("sl",    sl_live))
+    tp    = float(body.get("tp",    tp_live))
+    lot   = float(body.get("lot_size", body.get("lot", lot_live)))
 
     test_trade = {
-        "id": "test-" + str(uuid.uuid4())[:8],
-        "symbol": (body.get("symbol") or "EURUSD").upper(),
-        "direction": (body.get("direction") or "BUY").upper(),
-        "entry": float(body.get("entry", 1.10000)),
-        "sl": float(body.get("sl", 1.09500)),
-        "tp": float(body.get("tp", 1.11500)),
-        "risk_percent": 0.1,
-        "lot_size": 0.01,
-        "be_trigger_rr": 1.5,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": "execution_test",
-        "journal_trade_id": "",
-        "status": "approved",
-        "warnings": ["TEST TRADE — will not be executed on broker"],
-        "paper": True,
-        "test_only": True,
+        "id":               "test-" + str(uuid.uuid4())[:8],
+        "symbol":           symbol,
+        "direction":        direction,
+        "entry":            entry,
+        "sl":               sl,
+        "tp":               tp,
+        "risk_percent":     0.1,
+        "lot_size":         lot,
+        "be_trigger_rr":    1.5,
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "source":           "execution_test",
+        "journal_trade_id": "pipeline-test",
+        "status":           "approved",
+        "warnings":         ["TEST TRADE — will not be executed on broker"],
+        "paper":            True,
+        "test":             True,   # new explicit flag
+        "test_only":        True,   # legacy flag — EA reads this one
     }
     _execution_queue.append(test_trade)
 
     _log_execution_event(
         trade_id=test_trade["id"], symbol=test_trade["symbol"], direction=test_trade["direction"],
         planned_entry=test_trade["entry"], status="approved",
-        paper=True, test=True, reason="Synthetic test trade injected",
+        paper=True, test=True,
+        reason=f"Synthetic test trade — live levels (entry={entry}, sl={sl}, tp={tp})",
     )
 
     return jsonify({
-        "ok": True,
+        "ok":       True,
         "trade_id": test_trade["id"],
-        "message": "Test trade queued. EA will fetch within 5s. Poll /api/trade/status/<id> to track.",
-        "trade": test_trade,
+        "message":  "Test trade queued with live market levels. EA will fetch within 5s.",
+        "trade":    test_trade,
     }), 201
 
 
