@@ -112,6 +112,20 @@ int OnInit()
             "' len=", keyLen);
    }
 
+   // One-shot debug handshake: ask the backend to echo what it received vs
+   // what the env var has. Full response is printed so the two sides can
+   // be compared byte-for-byte when auth is failing. Intentionally called
+   // *regardless* of EnableAutoExecution because emergency-stop polling
+   // also uses the key, so auth failures happen even with auto-exec off.
+   if (keyLen > 0)
+   {
+      string dbg = HttpGetWithKey("/api/debug/key-echo");
+      if (StringLen(dbg) > 0)
+         Print("POIWatcher EXEC: key-echo = ", dbg);
+      else
+         Print("POIWatcher EXEC: key-echo — no response (check backend is reachable and URL is allow-listed)");
+   }
+
    bool isDemoAcct = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
    Print("Account mode: ", isDemoAcct ? "DEMO" : "LIVE",
          " | AllowLiveExecution=", AllowLiveExecution ? "true" : "false",
