@@ -2387,46 +2387,6 @@ def execution_emergency_stop():
     })
 
 
-@app.route("/api/debug/key-echo", methods=["GET"])
-def debug_key_echo():
-    """Diagnostic endpoint for debugging 401s on X-Execution-Key.
-
-    Returns a byte-level comparison of what the caller transmitted in the
-    X-Execution-Key header vs what EXECUTION_API_KEY is set to on the server.
-    Never returns the server key — only its first 4 chars and length, so no
-    secret is leaked. The hex of the *received* value is safe to return
-    because the caller already knows what they sent (helps them spot hidden
-    whitespace / smart-quote / encoding issues on their side).
-
-    No auth required (this is precisely the tool for diagnosing when auth
-    is failing). Intentionally not linked anywhere; leave it in place only
-    while debugging.
-    """
-    received = request.headers.get("X-Execution-Key", "")
-    server   = EXECUTION_API_KEY or ""
-
-    def preview(s):
-        return s[:4] if len(s) >= 4 else s
-
-    received_hex = received.encode("utf-8").hex()
-
-    return jsonify({
-        "received": {
-            "first4":    preview(received),
-            "len_chars": len(received),
-            "len_bytes": len(received.encode("utf-8")),
-            "hex":       received_hex,
-        },
-        "server": {
-            "first4":    preview(server),
-            "len_chars": len(server),
-            "len_bytes": len(server.encode("utf-8")),
-            "configured": bool(server),
-        },
-        "match": bool(server) and hmac.compare_digest(received, server),
-    })
-
-
 @app.route("/api/mt4/emergency-stop", methods=["GET"])
 @app.route("/api/mt5/emergency-stop", methods=["GET"])
 def mt4_emergency_stop_get():
