@@ -99,6 +99,19 @@ int OnInit()
    if (EnableAutoExecution && StringLen(ExecutionAPIKey) == 0)
       Print("WARNING: Auto Execution enabled but ExecutionAPIKey is empty!");
 
+   // Diagnostic: print first 4 chars of the key + length so we can verify
+   // the input reaches the EA correctly (helps diagnose 401s from backend).
+   // Never print the full key.
+   int keyLen = StringLen(ExecutionAPIKey);
+   if (keyLen == 0)
+      Print("POIWatcher EXEC: ExecutionAPIKey is EMPTY (len=0)");
+   else
+   {
+      string keyPrefix = (keyLen >= 4) ? StringSubstr(ExecutionAPIKey, 0, 4) : ExecutionAPIKey;
+      Print("POIWatcher EXEC: ExecutionAPIKey loaded — first4='", keyPrefix,
+            "' len=", keyLen);
+   }
+
    bool isDemoAcct = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
    Print("Account mode: ", isDemoAcct ? "DEMO" : "LIVE",
          " | AllowLiveExecution=", AllowLiveExecution ? "true" : "false",
@@ -581,6 +594,16 @@ void CheckForPendingExecution()
 
    // Fetch next approved trade from backend
    string response = HttpGetWithKey("/api/trade");
+
+   // Diagnostic — log every poll so we can see EA activity in MT5 Experts log.
+   // Truncate long responses to keep the log readable.
+   string logResp = response;
+   if (StringLen(logResp) == 0)
+      logResp = "<empty/error>";
+   else if (StringLen(logResp) > 200)
+      logResp = StringSubstr(logResp, 0, 200) + "...";
+   Print("POIWatcher EXEC: Polling /api/trade... response: ", logResp);
+
    if (StringLen(response) == 0) return;
 
    string status = JsonGetString(response, "status");
