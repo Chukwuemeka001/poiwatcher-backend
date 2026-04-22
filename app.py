@@ -894,26 +894,63 @@ def mt4_trade_open():
     trades_list.append(trade)
     save_trades(trades_list)
 
-    # Telegram notification
+    # Telegram notification — differentiate limit fills from regular opens
     direction = body.get("direction", "Long")
     symbol = body.get("symbol", "")
     entry = body.get("entry_price", 0)
     sl = body.get("stop_loss", 0)
     tp = body.get("take_profit", 0)
     lot = body.get("lot_size", 0)
+    order_type = body.get("order_type", "market").lower()
+    planned_entry = body.get("planned_entry")
+    actual_entry = body.get("actual_entry")
+    slippage_pips = body.get("slippage")
+    queue_id = body.get("execution_queue_id", "")
 
     platform_label = trade.get("platform", "mt5").upper()
-    msg = (
-        f"\U0001f4ca <b>Trade opened on {platform_label}!</b>\n\n"
-        f"<b>{symbol}</b> — {direction}\n"
-        f"\U0001f4cd Entry: <b>${entry}</b>\n"
-        f"\U0001f6d1 SL: ${sl} | \U0001f3af TP: ${tp}\n"
-        f"\U0001f4e6 Lot size: {lot}\n\n"
-        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open your journal to add your analysis!</a>"
-    )
+
+    if order_type == "limit":
+        # Mark matching pending limit order as filled
+        for lo in _pending_limit_orders:
+            if lo["id"] == queue_id or lo.get("order_ticket") == body.get("ticket"):
+                lo["status"] = "limit_order_filled"
+                lo["filled_at"] = datetime.now(timezone.utc).isoformat()
+                lo["actual_entry"] = actual_entry
+                break
+
+        slip_str = f"{slippage_pips:.1f}" if slippage_pips is not None else "0"
+        msg = (
+            f"\u2705 <b>Limit order FILLED!</b>\n\n"
+            f"<b>{symbol}</b> — {direction}\n"
+            f"\U0001f4cd Ordered at: <b>{planned_entry}</b>\n"
+            f"\U0001f4cd Filled at: <b>{actual_entry}</b>\n"
+            f"\U0001f4e6 Lot size: {lot}\n"
+            f"\U0001f6d1 SL: {sl} | \U0001f3af TP: {tp}\n"
+            f"Slippage: {slip_str} pips\n"
+            f"Trade is now LIVE \U0001f3af\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open your journal to add your analysis!</a>"
+        )
+        _log_execution_event(
+            trade_id=queue_id, symbol=symbol, direction=direction.upper(),
+            planned_entry=planned_entry, actual_entry=actual_entry,
+            slippage=slippage_pips, status="limit_order_filled",
+            mt4_ticket=body.get("ticket"),
+            paper=trade.get("paper", False),
+            reason="Limit order filled on MT5",
+        )
+    else:
+        msg = (
+            f"\U0001f4ca <b>Trade opened on {platform_label}!</b>\n\n"
+            f"<b>{symbol}</b> — {direction}\n"
+            f"\U0001f4cd Entry: <b>{entry}</b>\n"
+            f"\U0001f6d1 SL: {sl} | \U0001f3af TP: {tp}\n"
+            f"\U0001f4e6 Lot size: {lot}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open your journal to add your analysis!</a>"
+        )
     send_telegram(msg)
 
-    logging.info("%s trade opened: #%s %s %s @ %s", platform_label, body.get("ticket"), symbol, direction, entry)
+    logging.info("%s trade opened: #%s %s %s @ %s (order_type=%s)",
+                 platform_label, body.get("ticket"), symbol, direction, entry, order_type)
     return jsonify({"ok": True, "trade_id": trade["id"]}), 201
 
 
@@ -1731,6 +1768,11 @@ def binance_account():
 #               warnings, actual_entry, executed_at }
 _execution_queue = []
 
+# Pending limit orders — populated by /api/trade/limit-placed, cleared on fill/expiry
+# Each entry: { id, symbol, direction, entry, sl, tp, order_ticket,
+#               placed_at, expires_at, status, paper }
+_pending_limit_orders = []
+
 # Execution audit log (last N events). Each entry:
 # { ts, trade_id, symbol, direction, planned_entry, actual_entry, slippage,
 #   status, reason, mt4_ticket, paper, test }
@@ -2183,7 +2225,7 @@ def trade_executed():
 
 @app.route("/api/trade/cancelled", methods=["POST"])
 def trade_cancelled():
-    """POST /api/trade/cancelled — Cancel a pending trade."""
+    """POST /api/trade/cancelled — Cancel a pending trade or log a limit order expiry."""
     auth_err = _require_execution_key()
     if auth_err:
         return auth_err
@@ -2193,35 +2235,199 @@ def trade_cancelled():
         return jsonify({"error": "Trade id required"}), 400
 
     trade_id = body["id"]
+    raw_reason = body.get("reason", "Manual cancel")
+    is_limit_expired   = raw_reason == "limit_order_expired"
+    is_limit_cancelled = raw_reason == "limit_order_cancelled"
+    is_limit_event     = is_limit_expired or is_limit_cancelled
+
+    # --- Update pending limit orders list ---
+    if is_limit_event:
+        new_status = "limit_order_expired" if is_limit_expired else "limit_order_cancelled"
+        for lo in _pending_limit_orders:
+            if lo["id"] == trade_id:
+                lo["status"] = new_status
+                lo["ended_at"] = datetime.now(timezone.utc).isoformat()
+                break
+
+    # --- Update execution queue if entry exists ---
     found = None
     for t in _execution_queue:
         if t["id"] == trade_id:
             found = t
             break
 
-    if not found:
-        return jsonify({"error": "Trade not found in execution queue"}), 404
+    if found:
+        found["status"] = new_status if is_limit_event else "cancelled"
+        found["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+    # Limit events may arrive without a queue entry when the order was placed
+    # before a backend restart — that's fine, we still log and notify.
 
-    found["status"] = "cancelled"
-    found["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+    log_status = new_status if is_limit_event else "cancelled"
+    symbol    = (found["symbol"]    if found else body.get("symbol",    ""))
+    direction = (found["direction"] if found else body.get("direction", ""))
+    entry     = (found["entry"]     if found else body.get("entry",     0))
+    sl        = (found.get("sl")    if found else 0)
+    tp        = (found.get("tp")    if found else 0)
 
     _log_execution_event(
-        trade_id=trade_id, symbol=found["symbol"], direction=found["direction"],
-        planned_entry=found["entry"], status="cancelled",
-        paper=found.get("paper", False), test=found.get("test_only", False),
-        reason=body.get("reason") or "Manual cancel",
+        trade_id=trade_id, symbol=symbol, direction=direction,
+        planned_entry=entry, status=log_status,
+        paper=(found.get("paper", False) if found else False),
+        test=(found.get("test_only", False) if found else False),
+        reason=raw_reason,
+    )
+
+    # --- Telegram ---
+    if is_limit_expired:
+        expires_at = body.get("expires_at", "")
+        msg = (
+            f"\u23f0 <b>Limit order EXPIRED</b>\n\n"
+            f"<b>{symbol}</b> {direction}\n"
+            f"Price never reached <b>{entry}</b>\n"
+            f"Order cancelled after {body.get('expiry_hours', 24)}h\n"
+            f"(Expires: {expires_at})\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+        logging.info("Limit order expired: %s %s @ %s", trade_id, symbol, entry)
+    elif is_limit_cancelled:
+        msg = (
+            f"\u274c <b>Limit order cancelled</b>\n\n"
+            f"<b>{symbol}</b> {direction}\n"
+            f"Limit at: {entry} was cancelled manually\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+        logging.info("Limit order cancelled: %s %s @ %s", trade_id, symbol, entry)
+    else:
+        msg = (
+            f"\u274c <b>Trade cancelled</b>\n\n"
+            f"<b>{symbol}</b> {direction}\n"
+            f"Entry: {entry} | SL: {sl} | TP: {tp}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+        logging.info("Trade cancelled: %s %s", trade_id, symbol)
+
+    send_telegram(msg)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/trade/limit-placed", methods=["POST"])
+def trade_limit_placed():
+    """POST /api/trade/limit-placed — Called by EA when BuyLimit/SellLimit is placed."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+
+    body = request.json
+    if not body or not body.get("id"):
+        return jsonify({"error": "id required"}), 400
+
+    trade_id = body["id"]
+
+    # Find in execution queue to get full trade context
+    found = None
+    for t in _execution_queue:
+        if t["id"] == trade_id:
+            found = t
+            break
+
+    symbol    = body.get("symbol",    found["symbol"]    if found else "")
+    direction = body.get("direction", found["direction"] if found else "")
+    entry     = float(body.get("entry",   found["entry"] if found else 0))
+    sl        = float(body.get("sl",      found.get("sl", 0) if found else 0))
+    tp        = float(body.get("tp",      found.get("tp", 0) if found else 0))
+    expires_at = body.get("expires_at", "")
+    order_ticket = body.get("order_ticket")
+
+    if found:
+        found["status"] = "limit_placed"
+        found["limit_order_ticket"] = order_ticket
+        found["limit_placed_at"] = datetime.now(timezone.utc).isoformat()
+        found["limit_expires_at"] = expires_at
+
+    # Register in pending limit orders list (avoid duplicates)
+    if not any(lo["id"] == trade_id for lo in _pending_limit_orders):
+        _pending_limit_orders.append({
+            "id":           trade_id,
+            "symbol":       symbol,
+            "direction":    direction,
+            "entry":        entry,
+            "sl":           sl,
+            "tp":           tp,
+            "order_ticket": order_ticket,
+            "placed_at":    datetime.now(timezone.utc).isoformat(),
+            "expires_at":   expires_at,
+            "status":       "limit_placed",
+            "paper":        found.get("paper", PAPER_TRADING_MODE) if found else PAPER_TRADING_MODE,
+        })
+
+    _log_execution_event(
+        trade_id=trade_id, symbol=symbol, direction=direction,
+        planned_entry=entry, status="limit_order_placed",
+        paper=(found.get("paper", False) if found else False),
+        reason="Limit order placed on MT5 at " + str(entry),
     )
 
     msg = (
-        f"\u274c <b>Trade cancelled</b>\n\n"
-        f"<b>{found['symbol']}</b> {found['direction']}\n"
-        f"Entry: {found['entry']} | SL: {found['sl']} | TP: {found['tp']}\n\n"
-        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        f"\u23f3 <b>Limit order placed!</b>\n\n"
+        f"<b>{symbol}</b> {direction}\n"
+        f"Waiting for price: <b>{entry}</b>\n"
+        f"\U0001f6d1 SL: {sl} | \U0001f3af TP: {tp}\n"
+        f"Expires in 24h\n"
+        f"(Ticket #{order_ticket})\n\n"
+        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">View in journal</a>"
     )
     send_telegram(msg)
 
-    logging.info("Trade cancelled: %s %s", trade_id, found["symbol"])
+    logging.info("Limit order placed: %s %s %s @ %s", trade_id, symbol, direction, entry)
     return jsonify({"ok": True})
+
+
+@app.route("/api/pending-orders", methods=["GET"])
+def pending_orders():
+    """GET /api/pending-orders — Return all active (unfilled) limit orders."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+
+    active = [o for o in _pending_limit_orders if o.get("status") == "limit_placed"]
+    now = datetime.now(timezone.utc)
+
+    result = []
+    for o in active:
+        placed_str  = o.get("placed_at", "")
+        expires_str = o.get("expires_at", "")
+
+        hours_placed  = 0
+        hours_expires = 24
+        try:
+            placed_dt = datetime.fromisoformat(placed_str.replace("Z", "+00:00"))
+            hours_placed = round((now - placed_dt).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+        try:
+            exp_dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+            secs_left = (exp_dt - now).total_seconds()
+            hours_expires = max(0, round(secs_left / 3600, 1))
+        except Exception:
+            pass
+
+        result.append({
+            "id":            o["id"],
+            "symbol":        o["symbol"],
+            "direction":     o["direction"],
+            "entry":         o["entry"],
+            "sl":            o.get("sl"),
+            "tp":            o.get("tp"),
+            "order_ticket":  o.get("order_ticket"),
+            "placed_at":     placed_str,
+            "expires_at":    expires_str,
+            "hours_placed":  hours_placed,
+            "hours_left":    hours_expires,
+            "status":        o["status"],
+            "paper":         o.get("paper", False),
+        })
+
+    return jsonify({"orders": result, "total": len(result)})
 
 
 @app.route("/api/trade/status/<trade_id>", methods=["GET"])
@@ -2292,11 +2498,17 @@ def execution_log():
     entries = list(reversed(_execution_log))
     if status_filter and status_filter != "all":
         if status_filter == "success":
-            entries = [e for e in entries if e["status"] in ("executed", "paper_executed", "test_passed")]
+            entries = [e for e in entries if e["status"] in (
+                "executed", "paper_executed", "test_passed", "limit_order_filled")]
         elif status_filter == "failed":
-            entries = [e for e in entries if e["status"] in ("execution_failed", "test_failed", "rejected")]
+            entries = [e for e in entries if e["status"] in (
+                "execution_failed", "test_failed", "rejected")]
         elif status_filter == "paper":
             entries = [e for e in entries if e.get("paper")]
+        elif status_filter == "limit":
+            entries = [e for e in entries if e["status"] in (
+                "limit_order_placed", "limit_order_filled",
+                "limit_order_expired", "limit_order_cancelled")]
         else:
             entries = [e for e in entries if e["status"] == status_filter]
 

@@ -64,6 +64,8 @@ input int      ExecutionCheckSeconds  = 5;     // How often to poll backend for 
 input double   MaxLotSize             = 1.0;   // Hard safety cap - never execute above this
 input bool     AllowLiveExecution     = false; // Allow execution on LIVE when backend is PAPER mode
 input int      EmergencyCheckSeconds  = 10;    // How often to poll the emergency stop endpoint
+input string   OrderType              = "LIMIT"; // "LIMIT" or "MARKET" — LIMIT places pending orders at trade.entry
+input int      LimitExpiryHours       = 24;    // Cancel unfilled limit orders after this many hours
 
 //=== Internal state ===================================================
 //--- Position tracking (MQL5 uses ulong position tickets, not int)
@@ -78,8 +80,24 @@ datetime lastCheck      = 0;
 string   executedTradeIDs[];
 datetime lastExecCheck      = 0;
 datetime lastEmergencyCheck = 0;
+datetime lastPendingCheck   = 0;   // 60-second pending-limit-order monitor
 string   lastEmergencyAt    = "";  // unused — kept for future kill-switch use
 bool     g_emergencyActive  = false; // true = backend said pause, skip new executions
+
+//--- Pending limit order tracking — parallel arrays keyed by the same index.
+//    When a BuyLimit/SellLimit is placed we push a row here; CheckPendingLimitOrders
+//    iterates every 60s to detect fills (position appeared) vs expiry (neither
+//    pending order nor position found).
+ulong    pendingOrderTickets[];    // MT5 pending-order ticket returned by trade.ResultOrder()
+string   pendingOrderTradeIDs[];   // Backend trade id (same one EA got from /api/trade)
+string   pendingOrderSymbols[];
+string   pendingOrderDirections[]; // "BUY" or "SELL"
+double   pendingOrderEntry[];      // Limit price the order was placed at
+double   pendingOrderSL[];
+double   pendingOrderTP[];
+datetime pendingOrderPlacedAt[];
+datetime pendingOrderExpiresAt[];
+bool     pendingOrderIsPaper[];    // carry paper flag through so fill notification reflects it
 
 //--- CTrade instance (MQL5 replacement for OrderSend / OrderModify)
 CTrade trade;
@@ -94,7 +112,9 @@ int OnInit()
          " at 1:", DoubleToString(BreakEvenRR, 1), " RR");
    Print("Auto Execution: ", EnableAutoExecution ? "ON" : "OFF",
          " | MaxLot: ", DoubleToString(MaxLotSize, 2),
-         " | Check every ", ExecutionCheckSeconds, "s");
+         " | Check every ", ExecutionCheckSeconds, "s",
+         " | OrderType: ", OrderType,
+         (OrderType == "LIMIT" ? " | LimitExpiry: " + IntegerToString(LimitExpiryHours) + "h" : ""));
 
    if (EnableAutoExecution && StringLen(ExecutionAPIKey) == 0)
       Print("WARNING: Auto Execution enabled but ExecutionAPIKey is empty!");
@@ -185,6 +205,15 @@ void OnTimer()
    {
       lastEmergencyCheck = now;
       CheckForEmergencyStop();
+   }
+
+   // ── Pending limit order monitor ── (every 60 seconds)
+   // Always-on when auto-execution is on, so limit orders placed earlier are
+   // still tracked even if the EA is disabled for new fetches.
+   if (ArraySize(pendingOrderTickets) > 0 && now - lastPendingCheck >= 60)
+   {
+      lastPendingCheck = now;
+      CheckPendingLimitOrders();
    }
 
    // ── Heartbeat ──
@@ -759,70 +788,141 @@ void CheckForPendingExecution()
    }
 
    //── EXECUTE ────────────────────────────────────────────────────
-   double normSL  = NormalizeDouble(sl, digits);
-   double normTP  = NormalizeDouble(tp, digits);
-   string comment = "POIWatcher_" + tradeID;
+   double normSL    = NormalizeDouble(sl,    digits);
+   double normTP    = NormalizeDouble(tp,    digits);
+   double normEntry = NormalizeDouble(entry, digits);
+   string comment   = "POIWatcher_" + tradeID;
 
    // Re-apply deviation for this specific trade (in case input was changed)
    trade.SetDeviationInPoints((ulong)MaxSlippagePips * 10);
 
    bool success = false;
 
-   if (direction == "BUY")
+   if (OrderType == "LIMIT")
    {
-      double askPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
-      Print("POIWatcher EXEC: Placing BUY  ", symbol,
-            " lot=", DoubleToString(calcLot, 2),
-            " ask=", DoubleToString(askPrice, digits),
-            " sl=",  DoubleToString(normSL, digits),
-            " tp=",  DoubleToString(normTP, digits),
-            (isPaper ? " [PAPER]" : ""));
-      success = trade.Buy(calcLot, symbol, askPrice, normSL, normTP, comment);
-   }
-   else if (direction == "SELL")
-   {
-      double bidPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-      Print("POIWatcher EXEC: Placing SELL ", symbol,
-            " lot=", DoubleToString(calcLot, 2),
-            " bid=", DoubleToString(bidPrice, digits),
-            " sl=",  DoubleToString(normSL, digits),
-            " tp=",  DoubleToString(normTP, digits),
-            (isPaper ? " [PAPER]" : ""));
-      success = trade.Sell(calcLot, symbol, bidPrice, normSL, normTP, comment);
-   }
-   else
-   {
-      Print("POIWatcher EXEC: Invalid direction '", direction, "' — REJECTED");
-      SendExecutionResultEx(tradeID, 0, 0,
-            "Invalid direction: " + direction, isPaper, false);
+      //── LIMIT ORDER branch ─────────────────────────────────────
+      datetime expiryTime = TimeCurrent() + (datetime)(LimitExpiryHours * 3600);
+
+      if (direction == "BUY")
+      {
+         Print("POIWatcher EXEC: Placing BUY LIMIT  ", symbol,
+               " lot=", DoubleToString(calcLot, 2),
+               " @ ", DoubleToString(normEntry, digits),
+               " sl=", DoubleToString(normSL, digits),
+               " tp=", DoubleToString(normTP, digits),
+               " expiry=", TimeToString(expiryTime, TIME_DATE | TIME_MINUTES),
+               (isPaper ? " [PAPER]" : ""));
+         success = trade.BuyLimit(calcLot, normEntry, symbol, normSL, normTP,
+                                  ORDER_TIME_SPECIFIED, expiryTime, comment);
+      }
+      else if (direction == "SELL")
+      {
+         Print("POIWatcher EXEC: Placing SELL LIMIT ", symbol,
+               " lot=", DoubleToString(calcLot, 2),
+               " @ ", DoubleToString(normEntry, digits),
+               " sl=", DoubleToString(normSL, digits),
+               " tp=", DoubleToString(normTP, digits),
+               " expiry=", TimeToString(expiryTime, TIME_DATE | TIME_MINUTES),
+               (isPaper ? " [PAPER]" : ""));
+         success = trade.SellLimit(calcLot, normEntry, symbol, normSL, normTP,
+                                   ORDER_TIME_SPECIFIED, expiryTime, comment);
+      }
+      else
+      {
+         Print("POIWatcher EXEC: Invalid direction '", direction, "' — REJECTED");
+         SendExecutionResultEx(tradeID, 0, 0,
+               "Invalid direction: " + direction, isPaper, false);
+         MarkTradeExecuted(tradeID);
+         return;
+      }
+
       MarkTradeExecuted(tradeID);
-      return;
-   }
 
-   MarkTradeExecuted(tradeID); // Always mark — prevents retry loops on partial failures
+      if (success)
+      {
+         ulong orderTicket = trade.ResultOrder();
+         Print("POIWatcher EXEC: LIMIT ORDER PLACED — order #", orderTicket,
+               " ", symbol, " ", direction,
+               " @ ", DoubleToString(normEntry, digits),
+               " lot=", DoubleToString(calcLot, 2),
+               (isPaper ? " [PAPER]" : ""));
 
-   if (success)
-   {
-      ulong  dealTicket  = trade.ResultDeal();
-      double actualEntry = trade.ResultPrice();
-      uint   retcode     = trade.ResultRetcode();
+         // Register for monitoring
+         AddPendingLimitOrder(orderTicket, tradeID, symbol, direction,
+                              normEntry, normSL, normTP, expiryTime, isPaper);
 
-      Print("POIWatcher EXEC: SUCCESS — deal #", dealTicket,
-            " ", symbol, " ", direction,
-            " @ ", DoubleToString(actualEntry, digits),
-            " lot=", DoubleToString(calcLot, 2),
-            " retcode=", retcode,
-            (isPaper ? " [PAPER]" : ""));
-
-      SendExecutionResultEx(tradeID, (int)dealTicket, actualEntry, "", isPaper, false);
+         // Notify backend that limit order was placed
+         SendLimitOrderPlaced(tradeID, orderTicket, symbol, direction,
+                              normEntry, normSL, normTP, expiryTime);
+      }
+      else
+      {
+         uint   retcode = trade.ResultRetcode();
+         string errMsg  = "Limit order failed: retcode " + IntegerToString(retcode) +
+                          " (" + trade.ResultRetcodeDescription() + ")";
+         Print("POIWatcher EXEC: FAILED — ", errMsg);
+         SendExecutionResultEx(tradeID, 0, 0, errMsg, isPaper, false);
+      }
    }
    else
    {
-      uint   retcode = trade.ResultRetcode();
-      string errMsg  = "Order failed: retcode " + IntegerToString(retcode) +
-                       " (" + trade.ResultRetcodeDescription() + ")";
-      Print("POIWatcher EXEC: FAILED — ", errMsg);
-      SendExecutionResultEx(tradeID, 0, 0, errMsg, isPaper, false);
+      //── MARKET ORDER branch (existing behaviour) ────────────────
+      if (direction == "BUY")
+      {
+         double askPrice = SymbolInfoDouble(symbol, SYMBOL_ASK);
+         Print("POIWatcher EXEC: Placing BUY  ", symbol,
+               " lot=", DoubleToString(calcLot, 2),
+               " ask=", DoubleToString(askPrice, digits),
+               " sl=",  DoubleToString(normSL, digits),
+               " tp=",  DoubleToString(normTP, digits),
+               (isPaper ? " [PAPER]" : ""));
+         success = trade.Buy(calcLot, symbol, askPrice, normSL, normTP, comment);
+      }
+      else if (direction == "SELL")
+      {
+         double bidPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
+         Print("POIWatcher EXEC: Placing SELL ", symbol,
+               " lot=", DoubleToString(calcLot, 2),
+               " bid=", DoubleToString(bidPrice, digits),
+               " sl=",  DoubleToString(normSL, digits),
+               " tp=",  DoubleToString(normTP, digits),
+               (isPaper ? " [PAPER]" : ""));
+         success = trade.Sell(calcLot, symbol, bidPrice, normSL, normTP, comment);
+      }
+      else
+      {
+         Print("POIWatcher EXEC: Invalid direction '", direction, "' — REJECTED");
+         SendExecutionResultEx(tradeID, 0, 0,
+               "Invalid direction: " + direction, isPaper, false);
+         MarkTradeExecuted(tradeID);
+         return;
+      }
+
+      MarkTradeExecuted(tradeID); // Always mark — prevents retry loops on partial failures
+
+      if (success)
+      {
+         ulong  dealTicket  = trade.ResultDeal();
+         double actualEntry = trade.ResultPrice();
+         uint   retcode     = trade.ResultRetcode();
+
+         Print("POIWatcher EXEC: SUCCESS — deal #", dealTicket,
+               " ", symbol, " ", direction,
+               " @ ", DoubleToString(actualEntry, digits),
+               " lot=", DoubleToString(calcLot, 2),
+               " retcode=", retcode,
+               (isPaper ? " [PAPER]" : ""));
+
+         SendExecutionResultEx(tradeID, (int)dealTicket, actualEntry, "", isPaper, false);
+      }
+      else
+      {
+         uint   retcode = trade.ResultRetcode();
+         string errMsg  = "Order failed: retcode " + IntegerToString(retcode) +
+                          " (" + trade.ResultRetcodeDescription() + ")";
+         Print("POIWatcher EXEC: FAILED — ", errMsg);
+         SendExecutionResultEx(tradeID, 0, 0, errMsg, isPaper, false);
+      }
    }
 }
 
@@ -852,6 +952,241 @@ void SendExecutionResultEx(string tradeID, int ticket, double actualEntry,
    json += "}";
 
    HttpPostWithKey("/api/trade/executed", json);
+}
+
+//+------------------------------------------------------------------+
+//| Pending limit order tracking helpers                            |
+//+------------------------------------------------------------------+
+void AddPendingLimitOrder(ulong ticket, string tradeID, string sym, string dir,
+                           double entry, double pSL, double pTP,
+                           datetime expiresAt, bool isPaper)
+{
+   int sz = ArraySize(pendingOrderTickets);
+   ArrayResize(pendingOrderTickets,    sz + 1);
+   ArrayResize(pendingOrderTradeIDs,   sz + 1);
+   ArrayResize(pendingOrderSymbols,    sz + 1);
+   ArrayResize(pendingOrderDirections, sz + 1);
+   ArrayResize(pendingOrderEntry,      sz + 1);
+   ArrayResize(pendingOrderSL,         sz + 1);
+   ArrayResize(pendingOrderTP,         sz + 1);
+   ArrayResize(pendingOrderPlacedAt,   sz + 1);
+   ArrayResize(pendingOrderExpiresAt,  sz + 1);
+   ArrayResize(pendingOrderIsPaper,    sz + 1);
+
+   pendingOrderTickets[sz]    = ticket;
+   pendingOrderTradeIDs[sz]   = tradeID;
+   pendingOrderSymbols[sz]    = sym;
+   pendingOrderDirections[sz] = dir;
+   pendingOrderEntry[sz]      = entry;
+   pendingOrderSL[sz]         = pSL;
+   pendingOrderTP[sz]         = pTP;
+   pendingOrderPlacedAt[sz]   = TimeCurrent();
+   pendingOrderExpiresAt[sz]  = expiresAt;
+   pendingOrderIsPaper[sz]    = isPaper;
+
+   Print("POIWatcher: Pending limit order registered — ticket #", ticket,
+         " tradeID=", tradeID, " ", sym, " ", dir,
+         " @ ", DoubleToString(entry, 5),
+         " expires=", TimeToString(expiresAt, TIME_DATE | TIME_MINUTES));
+}
+
+void RemovePendingOrder(int idx)
+{
+   int last = ArraySize(pendingOrderTickets) - 1;
+   if (idx < last)
+   {
+      pendingOrderTickets[idx]    = pendingOrderTickets[last];
+      pendingOrderTradeIDs[idx]   = pendingOrderTradeIDs[last];
+      pendingOrderSymbols[idx]    = pendingOrderSymbols[last];
+      pendingOrderDirections[idx] = pendingOrderDirections[last];
+      pendingOrderEntry[idx]      = pendingOrderEntry[last];
+      pendingOrderSL[idx]         = pendingOrderSL[last];
+      pendingOrderTP[idx]         = pendingOrderTP[last];
+      pendingOrderPlacedAt[idx]   = pendingOrderPlacedAt[last];
+      pendingOrderExpiresAt[idx]  = pendingOrderExpiresAt[last];
+      pendingOrderIsPaper[idx]    = pendingOrderIsPaper[last];
+   }
+   ArrayResize(pendingOrderTickets,    last);
+   ArrayResize(pendingOrderTradeIDs,   last);
+   ArrayResize(pendingOrderSymbols,    last);
+   ArrayResize(pendingOrderDirections, last);
+   ArrayResize(pendingOrderEntry,      last);
+   ArrayResize(pendingOrderSL,         last);
+   ArrayResize(pendingOrderTP,         last);
+   ArrayResize(pendingOrderPlacedAt,   last);
+   ArrayResize(pendingOrderExpiresAt,  last);
+   ArrayResize(pendingOrderIsPaper,    last);
+}
+
+//+------------------------------------------------------------------+
+//| Monitor pending limit orders — runs every 60 seconds            |
+//|                                                                  |
+//| For each tracked limit order:                                    |
+//|   • If a position with the matching comment exists → FILLED      |
+//|   • If the pending order is gone and no position found → EXPIRED |
+//+------------------------------------------------------------------+
+void CheckPendingLimitOrders()
+{
+   datetime now = TimeCurrent();
+
+   for (int i = ArraySize(pendingOrderTickets) - 1; i >= 0; i--)
+   {
+      ulong    pTicket  = pendingOrderTickets[i];
+      string   tradeID  = pendingOrderTradeIDs[i];
+      string   sym      = pendingOrderSymbols[i];
+      string   dir      = pendingOrderDirections[i];
+      double   limEntry = pendingOrderEntry[i];
+      double   limSL    = pendingOrderSL[i];
+      double   limTP    = pendingOrderTP[i];
+      datetime expAt    = pendingOrderExpiresAt[i];
+      bool     paper    = pendingOrderIsPaper[i];
+
+      // ── Step 1: scan open positions for a fill matching our comment ──
+      string   matchComment = "POIWatcher_" + tradeID;
+      bool     filled       = false;
+      ulong    fillTicket   = 0;
+      double   fillPrice    = 0;
+
+      int total = PositionsTotal();
+      for (int p = total - 1; p >= 0; p--)
+      {
+         ulong pt = PositionGetTicket(p);
+         if (pt == 0) continue;
+         if (!PositionSelectByTicket(pt)) continue;
+         if (PositionGetString(POSITION_COMMENT) == matchComment)
+         {
+            filled     = true;
+            fillTicket = pt;
+            fillPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+            break;
+         }
+      }
+
+      if (filled)
+      {
+         int    digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+         double pt2      = SymbolInfoDouble(sym, SYMBOL_POINT);
+         double pipDiv   = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+         double slipPips = (pt2 > 0 && pipDiv > 0) ? MathAbs(fillPrice - limEntry) / pt2 / pipDiv : 0;
+
+         double posLots = 0;
+         if (PositionSelectByTicket(fillTicket))
+            posLots = PositionGetDouble(POSITION_VOLUME);
+
+         Print("POIWatcher: Limit FILLED — #", fillTicket,
+               " ", sym, " ", dir,
+               " planned=", DoubleToString(limEntry, digits),
+               " actual=",  DoubleToString(fillPrice, digits),
+               " slip=",    DoubleToString(slipPips, 1), " pips",
+               (paper ? " [PAPER]" : ""));
+
+         // POST fill to /mt5/trade-open with limit metadata
+         SendLimitOrderFilled(tradeID, fillTicket, sym, dir,
+                              limEntry, fillPrice, limSL, limTP, posLots, paper);
+
+         RemovePendingOrder(i);
+         continue;
+      }
+
+      // ── Step 2: check if the pending order still exists ──
+      bool orderStillOpen = false;
+      int pending = OrdersTotal();
+      for (int o = pending - 1; o >= 0; o--)
+      {
+         ulong ot = OrderGetTicket(o);
+         if (ot == pTicket) { orderStillOpen = true; break; }
+      }
+
+      if (!orderStillOpen)
+      {
+         // Order gone AND no matching position → expired or cancelled
+         string reason = (now >= expAt) ? "expired" : "cancelled";
+         Print("POIWatcher: Limit order ", reason, " — #", pTicket,
+               " ", sym, " ", dir,
+               " @ ", DoubleToString(limEntry, 5));
+
+         SendLimitOrderExpiredOrCancelled(tradeID, pTicket, sym, dir,
+                                          limEntry, expAt, reason);
+         RemovePendingOrder(i);
+      }
+      // else: still pending — nothing to do this cycle
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Notify backend: limit order placed                              |
+//+------------------------------------------------------------------+
+void SendLimitOrderPlaced(string tradeID, ulong orderTicket, string sym, string dir,
+                           double entry, double pSL, double pTP, datetime expiresAt)
+{
+   string json = "{";
+   json += "\"id\":\""           + tradeID                                                  + "\",";
+   json += "\"order_ticket\":"   + IntegerToString((long)orderTicket)                       +  ",";
+   json += "\"symbol\":\""       + sym                                                      + "\",";
+   json += "\"direction\":\""    + dir                                                      + "\",";
+   json += "\"entry\":"          + DoubleToString(entry, 5)                                 +  ",";
+   json += "\"sl\":"             + DoubleToString(pSL,   5)                                 +  ",";
+   json += "\"tp\":"             + DoubleToString(pTP,   5)                                 +  ",";
+   json += "\"expires_at\":\""   + TimeToString(expiresAt, TIME_DATE | TIME_SECONDS)        + "\",";
+   json += "\"timestamp\":\""    + TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)    + "\"";
+   json += "}";
+
+   HttpPostWithKey("/api/trade/limit-placed", json);
+}
+
+//+------------------------------------------------------------------+
+//| Notify backend: limit order filled → POST /mt5/trade-open       |
+//+------------------------------------------------------------------+
+void SendLimitOrderFilled(string tradeID, ulong fillTicket, string sym, string dir,
+                           double plannedEntry, double actualEntry,
+                           double pSL, double pTP, double lots, bool isPaper)
+{
+   int    digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double pt       = SymbolInfoDouble(sym, SYMBOL_POINT);
+   double pipDiv   = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+   double slipPips = (pt > 0 && pipDiv > 0) ? MathAbs(actualEntry - plannedEntry) / pt / pipDiv : 0;
+
+   string json = "{";
+   json += "\"ticket\":"              + IntegerToString((long)fillTicket)                        +  ",";
+   json += "\"symbol\":\""            + sym                                                      + "\",";
+   json += "\"direction\":\""         + (dir == "BUY" ? "Long" : "Short")                       + "\",";
+   json += "\"entry_price\":"         + DoubleToString(actualEntry,  digits)                     +  ",";
+   json += "\"stop_loss\":"           + DoubleToString(pSL,          digits)                     +  ",";
+   json += "\"take_profit\":"         + DoubleToString(pTP,          digits)                     +  ",";
+   json += "\"lot_size\":"            + DoubleToString(lots, 2)                                  +  ",";
+   json += "\"order_type\":\"limit\",";
+   json += "\"planned_entry\":"       + DoubleToString(plannedEntry, digits)                     +  ",";
+   json += "\"actual_entry\":"        + DoubleToString(actualEntry,  digits)                     +  ",";
+   json += "\"slippage\":"            + DoubleToString(slipPips, 1)                              +  ",";
+   json += "\"execution_queue_id\":\"" + tradeID                                                 + "\",";
+   json += "\"account_balance\":"     + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2)    +  ",";
+   json += "\"account_equity\":"      + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),  2)    +  ",";
+   json += "\"timestamp\":\""         + TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)    + "\",";
+   json += "\"platform\":\"mt5\"";
+   json += "}";
+
+   HttpPost("/mt5/trade-open", json);
+}
+
+//+------------------------------------------------------------------+
+//| Notify backend: limit order expired or cancelled                |
+//+------------------------------------------------------------------+
+void SendLimitOrderExpiredOrCancelled(string tradeID, ulong orderTicket, string sym,
+                                       string dir, double entry, datetime expiresAt,
+                                       string reason)
+{
+   string json = "{";
+   json += "\"id\":\""          + tradeID                                               + "\",";
+   json += "\"order_ticket\":"  + IntegerToString((long)orderTicket)                    +  ",";
+   json += "\"symbol\":\""      + sym                                                   + "\",";
+   json += "\"direction\":\""   + dir                                                   + "\",";
+   json += "\"entry\":"         + DoubleToString(entry, 5)                              +  ",";
+   json += "\"reason\":\"limit_order_" + reason                                         + "\",";
+   json += "\"expires_at\":\""  + TimeToString(expiresAt, TIME_DATE | TIME_SECONDS)    + "\",";
+   json += "\"timestamp\":\""   + TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS) + "\"";
+   json += "}";
+
+   HttpPostWithKey("/api/trade/cancelled", json);
 }
 
 //+------------------------------------------------------------------+
