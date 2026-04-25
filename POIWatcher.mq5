@@ -73,6 +73,16 @@ ulong    knownPositionTickets[];
 double   knownSL[];
 double   knownTP[];
 bool     beApplied[];
+//--- Journal-link tracking (parallel to knownPositionTickets[] by INDEX).
+//    When the EA fetches a trade from /api/trade, the backend returns
+//    `journal_trade_id` — the ID of the journal entry that spawned the trade.
+//    We stash it here alongside the planned entry/sl/tp so that when the
+//    position eventually closes we can send a close payload the backend
+//    can match back to the right Gist entry.
+string   knownJournalIDs[];
+double   knownPlannedEntry[];
+double   knownPlannedSL[];
+double   knownPlannedTP[];
 datetime lastHeartbeat  = 0;
 datetime lastCheck      = 0;
 
@@ -90,6 +100,7 @@ bool     g_emergencyActive  = false; // true = backend said pause, skip new exec
 //    pending order nor position found).
 ulong    pendingOrderTickets[];    // MT5 pending-order ticket returned by trade.ResultOrder()
 string   pendingOrderTradeIDs[];   // Backend trade id (same one EA got from /api/trade)
+string   pendingOrderJournalIDs[]; // Journal entry id — forwarded on fill/close so backend can match to Gist
 string   pendingOrderSymbols[];
 string   pendingOrderDirections[]; // "BUY" or "SELL"
 double   pendingOrderEntry[];      // Limit price the order was placed at
@@ -98,6 +109,16 @@ double   pendingOrderTP[];
 datetime pendingOrderPlacedAt[];
 datetime pendingOrderExpiresAt[];
 bool     pendingOrderIsPaper[];    // carry paper flag through so fill notification reflects it
+
+//--- Journal-ID cache: bridges /api/trade → CheckForNewPositions detection.
+//    Populated when the EA fetches an approved trade (indexed by backend tradeID);
+//    consumed when CheckForNewPositions or limit-fill detection sees a position
+//    with matching comment. Entries expire/remove after the position is linked.
+string   tradeJournalCache_BackendID[];
+string   tradeJournalCache_JournalID[];
+double   tradeJournalCache_PlannedEntry[];
+double   tradeJournalCache_PlannedSL[];
+double   tradeJournalCache_PlannedTP[];
 
 //--- CTrade instance (MQL5 replacement for OrderSend / OrderModify)
 CTrade trade;
@@ -242,6 +263,10 @@ void ScanOpenPositions()
    ArrayResize(knownSL, 0);
    ArrayResize(knownTP, 0);
    ArrayResize(beApplied, 0);
+   ArrayResize(knownJournalIDs, 0);
+   ArrayResize(knownPlannedEntry, 0);
+   ArrayResize(knownPlannedSL, 0);
+   ArrayResize(knownPlannedTP, 0);
 
    int total = PositionsTotal();
    for (int i = total - 1; i >= 0; i--)
@@ -253,6 +278,7 @@ void ScanOpenPositions()
       string sym   = PositionGetString(POSITION_SYMBOL);
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
       double pt    = SymbolInfoDouble(sym, SYMBOL_POINT);
 
       int size = ArraySize(knownPositionTickets);
@@ -260,12 +286,21 @@ void ScanOpenPositions()
       ArrayResize(knownSL, size + 1);
       ArrayResize(knownTP, size + 1);
       ArrayResize(beApplied, size + 1);
+      ArrayResize(knownJournalIDs, size + 1);
+      ArrayResize(knownPlannedEntry, size + 1);
+      ArrayResize(knownPlannedSL, size + 1);
+      ArrayResize(knownPlannedTP, size + 1);
 
       knownPositionTickets[size] = ticket;
       knownSL[size]              = sl;
-      knownTP[size]              = PositionGetDouble(POSITION_TP);
-      // BE already applied if SL is within 1 point of entry
+      knownTP[size]              = tp;
       beApplied[size]            = (sl > 0 && MathAbs(sl - entry) < pt);
+      // Positions snapshotted on startup weren't registered this session —
+      // no journal id available. Backend will fall back to ticket/fuzzy match.
+      knownJournalIDs[size]      = "";
+      knownPlannedEntry[size]    = entry;
+      knownPlannedSL[size]       = sl;
+      knownPlannedTP[size]       = tp;
    }
 
    Print("POIWatcher: Snapshot — ", ArraySize(knownPositionTickets),
@@ -284,22 +319,52 @@ void CheckForNewPositions()
       if (ticket == 0 || IsKnownPosition(ticket)) continue;
       if (!PositionSelectByTicket(ticket)) continue;
 
-      // Add to tracking arrays
+      // ── Try to recover journal_trade_id from comment ────────────────
+      // Market orders set comment = "POIWatcher_<backendTradeID>" and we
+      // stored a backendID → journalID map when the trade was fetched from
+      // /api/trade. Limit-order fills register directly via AddKnownPositionWithJournal.
+      string comment   = PositionGetString(POSITION_COMMENT);
+      string journalID = LookupJournalIDByBackendComment(comment);
+      double pEntry    = PositionGetDouble(POSITION_PRICE_OPEN);
+      double pSL       = PositionGetDouble(POSITION_SL);
+      double pTP       = PositionGetDouble(POSITION_TP);
+      // Prefer planned levels from cache (intent) over live levels (which may
+      // already reflect post-fill broker-side adjustments).
+      double cEntry = LookupPlannedEntryByBackendComment(comment);
+      double cSL    = LookupPlannedSLByBackendComment(comment);
+      double cTP    = LookupPlannedTPByBackendComment(comment);
+      if (cEntry > 0) pEntry = cEntry;
+      if (cSL    > 0) pSL    = cSL;
+      if (cTP    > 0) pTP    = cTP;
+      // Drop the cache entry once linked — keeps the cache small.
+      string backendID = ExtractBackendIDFromComment(comment);
+      if (StringLen(backendID) > 0 && StringLen(journalID) > 0)
+         RemoveTradeJournalCacheEntry(backendID);
+
       int size = ArraySize(knownPositionTickets);
       ArrayResize(knownPositionTickets, size + 1);
       ArrayResize(knownSL, size + 1);
       ArrayResize(knownTP, size + 1);
       ArrayResize(beApplied, size + 1);
+      ArrayResize(knownJournalIDs, size + 1);
+      ArrayResize(knownPlannedEntry, size + 1);
+      ArrayResize(knownPlannedSL, size + 1);
+      ArrayResize(knownPlannedTP, size + 1);
 
       knownPositionTickets[size] = ticket;
       knownSL[size]              = PositionGetDouble(POSITION_SL);
       knownTP[size]              = PositionGetDouble(POSITION_TP);
       beApplied[size]            = false;
+      knownJournalIDs[size]      = journalID;
+      knownPlannedEntry[size]    = pEntry;
+      knownPlannedSL[size]       = pSL;
+      knownPlannedTP[size]       = pTP;
 
       string sym  = PositionGetString(POSITION_SYMBOL);
       long   pTyp = PositionGetInteger(POSITION_TYPE);
       Print("POIWatcher: New position — #", ticket, " ", sym,
-            " ", (pTyp == POSITION_TYPE_BUY ? "Long" : "Short"));
+            " ", (pTyp == POSITION_TYPE_BUY ? "Long" : "Short"),
+            (StringLen(journalID) > 0 ? " (journal=" + journalID + ")" : " (no journal link)"));
 
       if (EnableAutoLogging)
          SendPositionOpen(ticket);
@@ -428,6 +493,123 @@ void CheckBreakEven()
    }
 }
 
+
+//====================================================================
+//  JOURNAL-LINK CACHE  (bridges /api/trade → CheckForNewPositions)
+//====================================================================
+//  When the EA fetches an approved trade from /api/trade we cache the
+//  journal_trade_id (and planned levels) keyed by the BACKEND tradeID
+//  that ends up in the position comment as "POIWatcher_<tradeID>".
+//  CheckForNewPositions reads the position comment and looks the cache
+//  up to attach the journal id to the open position. Limit-order fills
+//  consume the cache the same way through CheckPendingLimitOrders.
+//+------------------------------------------------------------------+
+void AddTradeJournalCacheEntry(string backendID, string journalID,
+                               double entry, double sl, double tp)
+{
+   if (StringLen(backendID) == 0) return;
+
+   // De-dup: if the same backend id is already cached, refresh in place.
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+   {
+      if (tradeJournalCache_BackendID[i] == backendID)
+      {
+         tradeJournalCache_JournalID[i]     = journalID;
+         tradeJournalCache_PlannedEntry[i]  = entry;
+         tradeJournalCache_PlannedSL[i]     = sl;
+         tradeJournalCache_PlannedTP[i]     = tp;
+         return;
+      }
+   }
+
+   int sz = ArraySize(tradeJournalCache_BackendID);
+   ArrayResize(tradeJournalCache_BackendID,    sz + 1);
+   ArrayResize(tradeJournalCache_JournalID,    sz + 1);
+   ArrayResize(tradeJournalCache_PlannedEntry, sz + 1);
+   ArrayResize(tradeJournalCache_PlannedSL,    sz + 1);
+   ArrayResize(tradeJournalCache_PlannedTP,    sz + 1);
+
+   tradeJournalCache_BackendID[sz]    = backendID;
+   tradeJournalCache_JournalID[sz]    = journalID;
+   tradeJournalCache_PlannedEntry[sz] = entry;
+   tradeJournalCache_PlannedSL[sz]    = sl;
+   tradeJournalCache_PlannedTP[sz]    = tp;
+}
+
+void RemoveTradeJournalCacheEntry(string backendID)
+{
+   if (StringLen(backendID) == 0) return;
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+   {
+      if (tradeJournalCache_BackendID[i] != backendID) continue;
+      // Shift left.
+      for (int j = i; j < ArraySize(tradeJournalCache_BackendID) - 1; j++)
+      {
+         tradeJournalCache_BackendID[j]    = tradeJournalCache_BackendID[j + 1];
+         tradeJournalCache_JournalID[j]    = tradeJournalCache_JournalID[j + 1];
+         tradeJournalCache_PlannedEntry[j] = tradeJournalCache_PlannedEntry[j + 1];
+         tradeJournalCache_PlannedSL[j]    = tradeJournalCache_PlannedSL[j + 1];
+         tradeJournalCache_PlannedTP[j]    = tradeJournalCache_PlannedTP[j + 1];
+      }
+      int sz = ArraySize(tradeJournalCache_BackendID) - 1;
+      ArrayResize(tradeJournalCache_BackendID,    sz);
+      ArrayResize(tradeJournalCache_JournalID,    sz);
+      ArrayResize(tradeJournalCache_PlannedEntry, sz);
+      ArrayResize(tradeJournalCache_PlannedSL,    sz);
+      ArrayResize(tradeJournalCache_PlannedTP,    sz);
+      return;
+   }
+}
+
+//--- Pull the backend tradeID out of "POIWatcher_<tradeID>" position comment.
+//    Returns "" if the comment doesn't follow the expected format.
+string ExtractBackendIDFromComment(string comment)
+{
+   string prefix = "POIWatcher_";
+   int p = StringFind(comment, prefix);
+   if (p < 0) return "";
+   return StringSubstr(comment, p + StringLen(prefix));
+}
+
+string LookupJournalIDByBackendComment(string comment)
+{
+   string backendID = ExtractBackendIDFromComment(comment);
+   if (StringLen(backendID) == 0) return "";
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+      if (tradeJournalCache_BackendID[i] == backendID)
+         return tradeJournalCache_JournalID[i];
+   return "";
+}
+
+double LookupPlannedEntryByBackendComment(string comment)
+{
+   string backendID = ExtractBackendIDFromComment(comment);
+   if (StringLen(backendID) == 0) return 0.0;
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+      if (tradeJournalCache_BackendID[i] == backendID)
+         return tradeJournalCache_PlannedEntry[i];
+   return 0.0;
+}
+
+double LookupPlannedSLByBackendComment(string comment)
+{
+   string backendID = ExtractBackendIDFromComment(comment);
+   if (StringLen(backendID) == 0) return 0.0;
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+      if (tradeJournalCache_BackendID[i] == backendID)
+         return tradeJournalCache_PlannedSL[i];
+   return 0.0;
+}
+
+double LookupPlannedTPByBackendComment(string comment)
+{
+   string backendID = ExtractBackendIDFromComment(comment);
+   if (StringLen(backendID) == 0) return 0.0;
+   for (int i = 0; i < ArraySize(tradeJournalCache_BackendID); i++)
+      if (tradeJournalCache_BackendID[i] == backendID)
+         return tradeJournalCache_PlannedTP[i];
+   return 0.0;
+}
 
 //====================================================================
 //  TRADE EXECUTION PIPELINE
@@ -649,24 +831,32 @@ void CheckForPendingExecution()
    tradeStart += 8; // skip past "trade":
    string tj = StringSubstr(response, tradeStart); // tj = trade JSON substring
 
-   string tradeID   = JsonGetString(tj, "id");
-   string symbol    = JsonGetString(tj, "symbol");
-   string direction = JsonGetString(tj, "direction");
-   double entry     = JsonGetDouble(tj, "entry");
-   double sl        = JsonGetDouble(tj, "sl");
-   double tp        = JsonGetDouble(tj, "tp");
-   double riskPct   = JsonGetDouble(tj, "risk_percent");
-   double lotSize   = JsonGetDouble(tj, "lot_size");
-   string paperFlag = JsonGetString(tj, "paper_trading");
-   string testFlag  = JsonGetString(tj, "test_only");
-   bool   isPaper   = (paperFlag == "true" || paperFlag == "True" || paperFlag == "1");
-   bool   isTest    = (testFlag  == "true" || testFlag  == "True" || testFlag  == "1");
+   string tradeID        = JsonGetString(tj, "id");
+   string symbol         = JsonGetString(tj, "symbol");
+   string direction      = JsonGetString(tj, "direction");
+   double entry          = JsonGetDouble(tj, "entry");
+   double sl             = JsonGetDouble(tj, "sl");
+   double tp             = JsonGetDouble(tj, "tp");
+   double riskPct        = JsonGetDouble(tj, "risk_percent");
+   double lotSize        = JsonGetDouble(tj, "lot_size");
+   string paperFlag      = JsonGetString(tj, "paper_trading");
+   string testFlag       = JsonGetString(tj, "test_only");
+   // Backend forwards the original journal entry id (e.g. "trade_001") so that
+   // when this trade closes we can match the close event back to the right Gist
+   // row. Stored in a small bridge cache keyed by backend tradeID until the
+   // resulting position is detected.
+   string journalTradeID = JsonGetString(tj, "journal_trade_id");
+   bool   isPaper        = (paperFlag == "true" || paperFlag == "True" || paperFlag == "1");
+   bool   isTest         = (testFlag  == "true" || testFlag  == "True" || testFlag  == "1");
 
    if (StringLen(tradeID) == 0 || StringLen(symbol) == 0)
    {
       Print("POIWatcher EXEC: Malformed trade response — missing id or symbol");
       return;
    }
+
+   // Stash the journal id keyed by backend tradeID for later linkage.
+   AddTradeJournalCacheEntry(tradeID, journalTradeID, entry, sl, tp);
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    if (digits == 0) digits = 5; // sensible default
@@ -962,30 +1152,37 @@ void AddPendingLimitOrder(ulong ticket, string tradeID, string sym, string dir,
                            datetime expiresAt, bool isPaper)
 {
    int sz = ArraySize(pendingOrderTickets);
-   ArrayResize(pendingOrderTickets,    sz + 1);
-   ArrayResize(pendingOrderTradeIDs,   sz + 1);
-   ArrayResize(pendingOrderSymbols,    sz + 1);
-   ArrayResize(pendingOrderDirections, sz + 1);
-   ArrayResize(pendingOrderEntry,      sz + 1);
-   ArrayResize(pendingOrderSL,         sz + 1);
-   ArrayResize(pendingOrderTP,         sz + 1);
-   ArrayResize(pendingOrderPlacedAt,   sz + 1);
-   ArrayResize(pendingOrderExpiresAt,  sz + 1);
-   ArrayResize(pendingOrderIsPaper,    sz + 1);
+   ArrayResize(pendingOrderTickets,     sz + 1);
+   ArrayResize(pendingOrderTradeIDs,    sz + 1);
+   ArrayResize(pendingOrderJournalIDs,  sz + 1);
+   ArrayResize(pendingOrderSymbols,     sz + 1);
+   ArrayResize(pendingOrderDirections,  sz + 1);
+   ArrayResize(pendingOrderEntry,       sz + 1);
+   ArrayResize(pendingOrderSL,          sz + 1);
+   ArrayResize(pendingOrderTP,          sz + 1);
+   ArrayResize(pendingOrderPlacedAt,    sz + 1);
+   ArrayResize(pendingOrderExpiresAt,   sz + 1);
+   ArrayResize(pendingOrderIsPaper,     sz + 1);
 
-   pendingOrderTickets[sz]    = ticket;
-   pendingOrderTradeIDs[sz]   = tradeID;
-   pendingOrderSymbols[sz]    = sym;
-   pendingOrderDirections[sz] = dir;
-   pendingOrderEntry[sz]      = entry;
-   pendingOrderSL[sz]         = pSL;
-   pendingOrderTP[sz]         = pTP;
-   pendingOrderPlacedAt[sz]   = TimeCurrent();
-   pendingOrderExpiresAt[sz]  = expiresAt;
-   pendingOrderIsPaper[sz]    = isPaper;
+   pendingOrderTickets[sz]     = ticket;
+   pendingOrderTradeIDs[sz]    = tradeID;
+   // Pull the matching journal id out of the cache so we have it on hand
+   // even after the cache entry is consumed by CheckForNewPositions. Useful
+   // for the limit-fill backend notification.
+   pendingOrderJournalIDs[sz]  = LookupJournalIDByBackendComment("POIWatcher_" + tradeID);
+   pendingOrderSymbols[sz]     = sym;
+   pendingOrderDirections[sz]  = dir;
+   pendingOrderEntry[sz]       = entry;
+   pendingOrderSL[sz]          = pSL;
+   pendingOrderTP[sz]          = pTP;
+   pendingOrderPlacedAt[sz]    = TimeCurrent();
+   pendingOrderExpiresAt[sz]   = expiresAt;
+   pendingOrderIsPaper[sz]     = isPaper;
 
    Print("POIWatcher: Pending limit order registered — ticket #", ticket,
-         " tradeID=", tradeID, " ", sym, " ", dir,
+         " tradeID=", tradeID,
+         " journal=", (StringLen(pendingOrderJournalIDs[sz]) > 0 ? pendingOrderJournalIDs[sz] : "(none)"),
+         " ", sym, " ", dir,
          " @ ", DoubleToString(entry, 5),
          " expires=", TimeToString(expiresAt, TIME_DATE | TIME_MINUTES));
 }
@@ -995,27 +1192,29 @@ void RemovePendingOrder(int idx)
    int last = ArraySize(pendingOrderTickets) - 1;
    if (idx < last)
    {
-      pendingOrderTickets[idx]    = pendingOrderTickets[last];
-      pendingOrderTradeIDs[idx]   = pendingOrderTradeIDs[last];
-      pendingOrderSymbols[idx]    = pendingOrderSymbols[last];
-      pendingOrderDirections[idx] = pendingOrderDirections[last];
-      pendingOrderEntry[idx]      = pendingOrderEntry[last];
-      pendingOrderSL[idx]         = pendingOrderSL[last];
-      pendingOrderTP[idx]         = pendingOrderTP[last];
-      pendingOrderPlacedAt[idx]   = pendingOrderPlacedAt[last];
-      pendingOrderExpiresAt[idx]  = pendingOrderExpiresAt[last];
-      pendingOrderIsPaper[idx]    = pendingOrderIsPaper[last];
+      pendingOrderTickets[idx]     = pendingOrderTickets[last];
+      pendingOrderTradeIDs[idx]    = pendingOrderTradeIDs[last];
+      pendingOrderJournalIDs[idx]  = pendingOrderJournalIDs[last];
+      pendingOrderSymbols[idx]     = pendingOrderSymbols[last];
+      pendingOrderDirections[idx]  = pendingOrderDirections[last];
+      pendingOrderEntry[idx]       = pendingOrderEntry[last];
+      pendingOrderSL[idx]          = pendingOrderSL[last];
+      pendingOrderTP[idx]          = pendingOrderTP[last];
+      pendingOrderPlacedAt[idx]    = pendingOrderPlacedAt[last];
+      pendingOrderExpiresAt[idx]   = pendingOrderExpiresAt[last];
+      pendingOrderIsPaper[idx]     = pendingOrderIsPaper[last];
    }
-   ArrayResize(pendingOrderTickets,    last);
-   ArrayResize(pendingOrderTradeIDs,   last);
-   ArrayResize(pendingOrderSymbols,    last);
-   ArrayResize(pendingOrderDirections, last);
-   ArrayResize(pendingOrderEntry,      last);
-   ArrayResize(pendingOrderSL,         last);
-   ArrayResize(pendingOrderTP,         last);
-   ArrayResize(pendingOrderPlacedAt,   last);
-   ArrayResize(pendingOrderExpiresAt,  last);
-   ArrayResize(pendingOrderIsPaper,    last);
+   ArrayResize(pendingOrderTickets,     last);
+   ArrayResize(pendingOrderTradeIDs,    last);
+   ArrayResize(pendingOrderJournalIDs,  last);
+   ArrayResize(pendingOrderSymbols,     last);
+   ArrayResize(pendingOrderDirections,  last);
+   ArrayResize(pendingOrderEntry,       last);
+   ArrayResize(pendingOrderSL,          last);
+   ArrayResize(pendingOrderTP,          last);
+   ArrayResize(pendingOrderPlacedAt,    last);
+   ArrayResize(pendingOrderExpiresAt,   last);
+   ArrayResize(pendingOrderIsPaper,     last);
 }
 
 //+------------------------------------------------------------------+
@@ -1080,9 +1279,13 @@ void CheckPendingLimitOrders()
                " slip=",    DoubleToString(slipPips, 1), " pips",
                (paper ? " [PAPER]" : ""));
 
-         // POST fill to /mt5/trade-open with limit metadata
+         // POST fill to /mt5/trade-open with limit metadata.
+         // Pass through the cached journal id so the backend can pre-link this
+         // fill to its source journal entry without waiting for the close.
+         string fillJournalID = pendingOrderJournalIDs[i];
          SendLimitOrderFilled(tradeID, fillTicket, sym, dir,
-                              limEntry, fillPrice, limSL, limTP, posLots, paper);
+                              limEntry, fillPrice, limSL, limTP, posLots, paper,
+                              fillJournalID);
 
          RemovePendingOrder(i);
          continue;
@@ -1139,7 +1342,8 @@ void SendLimitOrderPlaced(string tradeID, ulong orderTicket, string sym, string 
 //+------------------------------------------------------------------+
 void SendLimitOrderFilled(string tradeID, ulong fillTicket, string sym, string dir,
                            double plannedEntry, double actualEntry,
-                           double pSL, double pTP, double lots, bool isPaper)
+                           double pSL, double pTP, double lots, bool isPaper,
+                           string journalTradeID)
 {
    int    digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double pt       = SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -1159,6 +1363,8 @@ void SendLimitOrderFilled(string tradeID, ulong fillTicket, string sym, string d
    json += "\"actual_entry\":"        + DoubleToString(actualEntry,  digits)                     +  ",";
    json += "\"slippage\":"            + DoubleToString(slipPips, 1)                              +  ",";
    json += "\"execution_queue_id\":\"" + tradeID                                                 + "\",";
+   if (StringLen(journalTradeID) > 0)
+      json += "\"journal_trade_id\":\"" + journalTradeID                                         + "\",";
    json += "\"account_balance\":"     + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2)    +  ",";
    json += "\"account_equity\":"      + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),  2)    +  ",";
    json += "\"timestamp\":\""         + TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)    + "\",";
@@ -1307,9 +1513,22 @@ void SendPositionOpen(ulong ticket)
 //| HistorySelectByPosition(positionId) loads all deals for the     |
 //| position; we find the DEAL_ENTRY_IN for open data and           |
 //| DEAL_ENTRY_OUT for close data.                                  |
+//|                                                                  |
+//| Payload includes journal_trade_id (so the backend can match the  |
+//| close to its source Gist entry), signed actual_rr, signed pips,  |
+//| close_reason derived from DEAL_REASON, and the planned levels    |
+//| captured at execution time.                                      |
 //+------------------------------------------------------------------+
 void SendPositionClose(ulong ticket)
 {
+   // Pull session metadata BEFORE history is consulted — RemovePosition
+   // hasn't run yet so the index is still valid.
+   int    posIdx       = GetPositionIndex(ticket);
+   string journalID    = (posIdx >= 0) ? knownJournalIDs[posIdx]   : "";
+   double plannedEntry = (posIdx >= 0) ? knownPlannedEntry[posIdx] : 0;
+   double plannedSL    = (posIdx >= 0) ? knownPlannedSL[posIdx]    : 0;
+   double plannedTP    = (posIdx >= 0) ? knownPlannedTP[posIdx]    : 0;
+
    // Load history for this specific position
    // (ticket == positionId for standard MT5 positions)
    bool histOk = HistorySelectByPosition(ticket);
@@ -1319,17 +1538,18 @@ void SendPositionClose(ulong ticket)
       HistorySelect(TimeCurrent() - 7 * 86400, TimeCurrent());
    }
 
-   int     dealsTotal  = HistoryDealsTotal();
-   ulong   closeDeal   = 0;
-   double  closePrice  = 0;
-   double  profit      = 0;
-   double  swapVal     = 0;
-   double  commission  = 0;
-   datetime openTime   = 0;
-   datetime closeTime  = 0;
-   double  entryPrice  = 0;
-   string  symbol      = "";
-   long    closeDealType = -1; // DEAL_TYPE of the closing deal
+   int      dealsTotal    = HistoryDealsTotal();
+   ulong    closeDeal     = 0;
+   double   closePrice    = 0;
+   double   profit        = 0;
+   double   swapVal       = 0;
+   double   commission    = 0;
+   datetime openTime      = 0;
+   datetime closeTime     = 0;
+   double   entryPrice    = 0;
+   string   symbol        = "";
+   long     closeDealType = -1; // DEAL_TYPE of the closing deal
+   long     closeReasonId = -1; // DEAL_REASON of the closing deal
 
    for (int i = 0; i < dealsTotal; i++)
    {
@@ -1357,6 +1577,7 @@ void SendPositionClose(ulong ticket)
          commission    = HistoryDealGetDouble(dTicket, DEAL_COMMISSION);
          closeTime     = (datetime)HistoryDealGetInteger(dTicket, DEAL_TIME);
          closeDealType = HistoryDealGetInteger(dTicket, DEAL_TYPE);
+         closeReasonId = HistoryDealGetInteger(dTicket, DEAL_REASON);
          if (symbol == "") symbol = HistoryDealGetString(dTicket, DEAL_SYMBOL);
       }
    }
@@ -1373,25 +1594,81 @@ void SendPositionClose(ulong ticket)
    double pipDiv      = (digits == 3 || digits == 5) ? 10.0 : 1.0;
    double totalProfit = profit + swapVal + commission;
 
-   // Pip calculation
-   double pips = 0;
-   if (entryPrice > 0 && pt > 0)
-   {
-      pips = MathAbs(closePrice - entryPrice) / pt / pipDiv;
-      if (totalProfit < 0) pips = -pips; // losing trade = negative pips
-   }
-
    // Derive position direction from the close deal type:
    // A SELL deal closes a BUY position; a BUY deal closes a SELL position.
    string direction = "Long";
    if (closeDealType == DEAL_TYPE_BUY)  direction = "Short"; // BUY deal closed a SELL position
    if (closeDealType == DEAL_TYPE_SELL) direction = "Long";  // SELL deal closed a BUY position
+   bool isLong = (direction == "Long");
+
+   // SIGNED pip calculation. Long: close - entry; Short: entry - close.
+   // Use the actual fill price as the entry reference (entryPrice from
+   // DEAL_ENTRY_IN), not the planned entry — pips reflects what the
+   // *position* did, not what the strategy planned.
+   double pips = 0;
+   if (entryPrice > 0 && pt > 0)
+   {
+      double rawPipDist = (isLong ? (closePrice - entryPrice)
+                                  : (entryPrice - closePrice)) / pt / pipDiv;
+      pips = rawPipDist; // already signed
+   }
 
    int durationMin = (openTime > 0 && closeTime > 0)
                      ? (int)((closeTime - openTime) / 60) : 0;
 
+   //── close_reason: derived from DEAL_REASON, with Break-Even override ──
+   //
+   // DEAL_REASON_SL/TP are unambiguous. CLIENT/MOBILE/WEB/EXPERT are all
+   // user-initiated → "Manual Close". If the broker doesn't tag the deal
+   // (closeReasonId == -1) or returns an unknown reason, default to manual.
+   //
+   // Break-Even override: if the close price sits roughly on the planned
+   // entry AND the position had its SL pulled to entry (BE applied), we
+   // categorise the close as "Break Even" regardless of what DEAL_REASON
+   // says. This catches the BE-stop-out case which DEAL_REASON_SL would
+   // otherwise classify as "SL Hit".
+   string closeReason = "Manual Close";
+   if      (closeReasonId == DEAL_REASON_TP) closeReason = "TP Hit";
+   else if (closeReasonId == DEAL_REASON_SL) closeReason = "SL Hit";
+   else if (closeReasonId == DEAL_REASON_SO) closeReason = "Stop Out";
+
+   if (plannedEntry > 0 && pt > 0)
+   {
+      double bePipDist  = MathAbs(closePrice - plannedEntry) / pt / pipDiv;
+      bool   beApp      = (posIdx >= 0) ? beApplied[posIdx] : false;
+      // ≤ 1 pip away from planned entry AND BE was active → Break Even
+      if (bePipDist <= 1.0 && beApp)
+         closeReason = "Break Even";
+   }
+
+   //── Signed Actual R:R ────────────────────────────────────────────────
+   //
+   //   long:   actual_rr = (close - planned_entry) / |planned_entry - planned_sl|
+   //   short:  actual_rr = (planned_entry - close) / |planned_entry - planned_sl|
+   //   BE:     actual_rr = 0
+   //
+   // Falls back to 0 if planned levels are unavailable (e.g. position was
+   // snapshotted at startup and never linked to a journal entry).
+   double actualRR = 0;
+   if (closeReason == "Break Even")
+   {
+      actualRR = 0;
+   }
+   else if (plannedEntry > 0 && plannedSL > 0)
+   {
+      double riskDist = MathAbs(plannedEntry - plannedSL);
+      if (riskDist > 0)
+      {
+         double signedDist = isLong ? (closePrice - plannedEntry)
+                                    : (plannedEntry - closePrice);
+         actualRR = signedDist / riskDist;
+      }
+   }
+
    string json = "{";
    json += "\"ticket\":"            + IntegerToString((long)ticket)            + ",";
+   if (StringLen(journalID) > 0)
+      json += "\"journal_trade_id\":\"" + journalID                            + "\",";
    json += "\"symbol\":\""          + symbol                                   + "\",";
    json += "\"direction\":\""       + direction                                + "\",";
    json += "\"entry_price\":"       + DoubleToString(entryPrice, digits)       + ",";
@@ -1399,9 +1676,21 @@ void SendPositionClose(ulong ticket)
    json += "\"profit_loss\":"       + DoubleToString(totalProfit, 2)           + ",";
    json += "\"pips\":"              + DoubleToString(pips, 1)                  + ",";
    json += "\"duration_minutes\":"  + IntegerToString(durationMin)             + ",";
-   json += "\"close_reason\":\"Manual close\",";
+   json += "\"close_reason\":\""    + closeReason                              + "\",";
+   json += "\"actual_rr\":"         + DoubleToString(actualRR, 2)              + ",";
+   json += "\"planned_entry\":"     + DoubleToString(plannedEntry, digits)     + ",";
+   json += "\"planned_sl\":"        + DoubleToString(plannedSL,    digits)     + ",";
+   json += "\"planned_tp\":"        + DoubleToString(plannedTP,    digits)     + ",";
+   json += "\"deal_reason_id\":"    + IntegerToString((int)closeReasonId)      + ",";
    json += "\"platform\":\"mt5\"";
    json += "}";
+
+   Print("POIWatcher: Closing payload — ticket=", ticket,
+         " journal=", (StringLen(journalID) > 0 ? journalID : "(none)"),
+         " reason=", closeReason,
+         " rr=", DoubleToString(actualRR, 2),
+         " pips=", DoubleToString(pips, 1),
+         " pl=", DoubleToString(totalProfit, 2));
 
    HttpPost("/mt5/trade-close", json);
 }
@@ -1475,10 +1764,18 @@ void RemovePosition(int idx)
       knownSL[idx]              = knownSL[last];
       knownTP[idx]              = knownTP[last];
       beApplied[idx]            = beApplied[last];
+      knownJournalIDs[idx]      = knownJournalIDs[last];
+      knownPlannedEntry[idx]    = knownPlannedEntry[last];
+      knownPlannedSL[idx]       = knownPlannedSL[last];
+      knownPlannedTP[idx]       = knownPlannedTP[last];
    }
    ArrayResize(knownPositionTickets, last);
    ArrayResize(knownSL,              last);
    ArrayResize(knownTP,              last);
    ArrayResize(beApplied,            last);
+   ArrayResize(knownJournalIDs,      last);
+   ArrayResize(knownPlannedEntry,    last);
+   ArrayResize(knownPlannedSL,       last);
+   ArrayResize(knownPlannedTP,       last);
 }
 //+------------------------------------------------------------------+

@@ -871,6 +871,13 @@ def mt4_trade_to_journal(body):
         "mt4Ticket": body.get("ticket"),
         "mt4Balance": body.get("account_balance"),
         "mt4Equity": body.get("account_equity"),
+        # Journal-link metadata: when the EA fills a queued trade it forwards
+        # the journal entry id that spawned the execution. Stored on this
+        # auto-logged row so the close-side matcher has another path to link
+        # opens that originated from the journal but were materialised by the
+        # EA as fresh "mt4_<ticket>" rows.
+        "journalTradeId": body.get("journal_trade_id"),
+        "executionQueueId": body.get("execution_queue_id"),
         # Meta
         "createdAt": now,
         "updatedAt": now,
@@ -957,73 +964,290 @@ def mt4_trade_open():
 @app.route("/mt4/trade-close", methods=["POST"])
 @app.route("/mt5/trade-close", methods=["POST"])
 def mt4_trade_close():
+    """MT4/MT5 close webhook.
+
+    Three-tier matching strategy — we want the journal Gist row that this
+    closed position originated from, even when the row id and the MT5 ticket
+    don't share a prefix:
+
+      Tier 1 — exact match on ``journalTradeId`` / ``id`` against the
+               ``journal_trade_id`` the EA stored when fetching from
+               /api/trade. This is the strongest link.
+      Tier 2 — match on the MT5 ticket. Catches rows that were auto-logged
+               by /mt5/trade-open (id = "mt4_<ticket>"). Also catches rows
+               where the user manually pasted the ticket.
+      Tier 3 — fuzzy match by symbol + approximate entry + open date.
+               Last-resort heuristic for legacy rows that have neither.
+
+    On a hit we patch the row with the EA's full close payload and notify
+    Telegram. On a miss we *still* persist the close as a fresh auto-logged
+    row marked ``mt5AutoClose=True, reviewNeeded=True`` so the user can
+    review and link it manually from the journal.
+    """
     body = request.json
     if not body or not body.get("ticket"):
         return jsonify({"error": "ticket required"}), 400
 
-    trade_id = "mt4_" + str(body["ticket"])
+    ticket             = body.get("ticket")
+    journal_trade_id   = (body.get("journal_trade_id") or "").strip()
+    symbol             = body.get("symbol", "")
+    direction_in       = (body.get("direction") or "").strip()
+    exit_price         = float(body.get("exit_price", 0) or 0)
+    pnl                = float(body.get("profit_loss", 0) or 0)
+    pips               = float(body.get("pips", 0) or 0)
+    duration_min       = int(body.get("duration_minutes", 0) or 0)
+    close_reason       = body.get("close_reason", "Manual Close") or "Manual Close"
+    actual_rr_payload  = body.get("actual_rr")
+    planned_entry      = float(body.get("planned_entry", 0) or 0)
+    planned_sl         = float(body.get("planned_sl", 0) or 0)
+    planned_tp         = float(body.get("planned_tp", 0) or 0)
+
     trades_list = get_trades()
+
+    # ─────────────────────────────────────────────────────────────────
+    # TIER 1 — match by journal_trade_id (strongest link)
+    # ─────────────────────────────────────────────────────────────────
     found = None
-    for t in trades_list:
-        if t.get("id") == trade_id:
-            found = t
-            break
+    match_tier = None
+    if journal_trade_id:
+        for t in trades_list:
+            tid    = t.get("id")
+            jourId = t.get("journalTradeId")
+            if tid == journal_trade_id or jourId == journal_trade_id:
+                found = t
+                match_tier = "journal_trade_id"
+                break
 
+    # ─────────────────────────────────────────────────────────────────
+    # TIER 2 — match by MT5 ticket
+    # ─────────────────────────────────────────────────────────────────
     if not found:
-        return jsonify({"error": "Trade not found in journal"}), 404
+        ticket_str = str(ticket)
+        legacy_id  = "mt4_" + ticket_str
+        for t in trades_list:
+            if (
+                t.get("id") == legacy_id
+                or str(t.get("mt4Ticket") or "") == ticket_str
+                or str(t.get("mt5Ticket") or "") == ticket_str
+            ):
+                found = t
+                match_tier = "ticket"
+                break
 
-    # Update trade
-    exit_price = float(body.get("exit_price", 0))
-    pnl = float(body.get("profit_loss", 0))
-    entry = found.get("entry", 0)
-    sl = found.get("sl", 0)
-    sl_dist = abs(entry - sl) if sl else 0
-    exit_dist = abs(exit_price - entry)
-    actual_rr = (exit_dist / sl_dist) if sl_dist > 0 else 0
+    # ─────────────────────────────────────────────────────────────────
+    # TIER 3 — fuzzy match by symbol + approximate entry + open date
+    # ─────────────────────────────────────────────────────────────────
+    if not found and symbol and planned_entry > 0:
+        # 0.5% tolerance on entry price; same UTC calendar day on dateOpen.
+        from datetime import datetime as _dt
+        tol = max(planned_entry * 0.005, 0.0001)
+        today = _dt.utcnow().strftime("%Y-%m-%d")
+        for t in trades_list:
+            if t.get("status") == "closed":
+                continue
+            t_pair  = (t.get("pair") or "").upper()
+            t_entry = float(t.get("entry") or 0)
+            t_open  = (t.get("dateOpen") or "")[:10]
+            sym_match = (t_pair == symbol.upper())
+            entry_match = (t_entry > 0 and abs(t_entry - planned_entry) <= tol)
+            day_match = (t_open == today or t_open == "")
+            if sym_match and entry_match and day_match:
+                found = t
+                match_tier = "fuzzy"
+                break
 
-    found["status"] = "closed"
-    found["exitPrice"] = exit_price
-    found["actualPnL"] = pnl
-    found["dateClose"] = body.get("timestamp", datetime.now(timezone.utc).isoformat())
-    found["actualRR"] = round(actual_rr, 2)
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Determine outcome
+    # ─────────────────────────────────────────────────────────────────
+    # Compute signed actual_rr — prefer EA-supplied (already signed,
+    # uses planned levels) and fall back to local re-derivation if the
+    # payload didn't include it (older EA build).
+    # ─────────────────────────────────────────────────────────────────
     if pnl > 0:
-        found["outcome"] = "win"
+        outcome = "win"
     elif pnl < 0:
-        found["outcome"] = "loss"
+        outcome = "loss"
     else:
-        found["outcome"] = "be"
+        outcome = "be"
 
-    found["updatedAt"] = datetime.now(timezone.utc).isoformat()
-    found["mt4CloseReason"] = body.get("close_reason", "Manual close")
-    found["mt4Pips"] = body.get("pips", 0)
-    found["mt4Duration"] = body.get("duration_minutes", 0)
+    if actual_rr_payload is not None:
+        try:
+            actual_rr = float(actual_rr_payload)
+        except (TypeError, ValueError):
+            actual_rr = 0.0
+    else:
+        # Legacy fallback — derive from journal entry/sl + payload exit
+        ref_entry = planned_entry or (found.get("entry", 0) if found else 0)
+        ref_sl    = planned_sl    or (found.get("sl",    0) if found else 0)
+        ref_dir   = direction_in or (found.get("direction", "") if found else "")
+        sl_dist   = abs(ref_entry - ref_sl) if ref_sl else 0
+        if ref_dir.lower() in ("long", "buy"):
+            signed_profit = exit_price - ref_entry
+        elif ref_dir.lower() in ("short", "sell"):
+            signed_profit = ref_entry - exit_price
+        else:
+            signed_profit = abs(exit_price - ref_entry) * (1 if pnl > 0 else -1 if pnl < 0 else 0)
+        actual_rr = 0.0 if outcome == "be" else (
+            (signed_profit / sl_dist) if sl_dist > 0 else 0.0
+        )
 
+    # ─────────────────────────────────────────────────────────────────
+    # Compute MT5 entry slippage in pips: actual fill - planned entry,
+    # signed in trade direction (positive = better than planned).
+    # ─────────────────────────────────────────────────────────────────
+    entry_price_actual = float(body.get("entry_price", 0) or 0)
+    direction_lower = (direction_in or (found.get("direction", "") if found else "")).lower()
+    pip_size = 0.0001  # forex default
+    sym_upper = (symbol or (found.get("pair", "") if found else "")).upper()
+    if "JPY" in sym_upper:
+        pip_size = 0.01
+    if "BTC" in sym_upper or "ETH" in sym_upper or "XAU" in sym_upper:
+        pip_size = 1.0
+    mt5_slippage_pips = 0.0
+    if planned_entry > 0 and entry_price_actual > 0:
+        if direction_lower in ("long", "buy"):
+            # paying *more* than planned = negative slippage
+            mt5_slippage_pips = (planned_entry - entry_price_actual) / pip_size
+        elif direction_lower in ("short", "sell"):
+            # selling *lower* than planned = negative slippage
+            mt5_slippage_pips = (entry_price_actual - planned_entry) / pip_size
+
+    if found:
+        # ─────────── HIT — update the existing journal row ────────────
+        found["status"]            = "closed"
+        found["exitPrice"]         = exit_price
+        found["actualPnL"]         = pnl
+        found["dateClose"]         = body.get("timestamp", now_iso)
+        found["actualRR"]          = round(actual_rr, 2)
+        found["outcome"]           = outcome
+        found["updatedAt"]         = now_iso
+        # MT5-supplied fields. Keep both legacy (mt4*) and new (mt5*) keys
+        # populated so the frontend can rely on either.
+        found["mt4CloseReason"]    = close_reason
+        found["mt5CloseReason"]    = close_reason
+        found["mt4Pips"]           = pips
+        found["mt5Pips"]           = pips
+        found["mt4Duration"]       = duration_min
+        found["mt5Duration"]       = duration_min
+        found["mt5Slippage"]       = round(mt5_slippage_pips, 1)
+        found["mt5Ticket"]         = ticket
+        found["mt5AutoClose"]      = True
+        found["mt5ClosedAt"]       = now_iso
+        found["mt5MatchTier"]      = match_tier
+        found["reviewNeeded"]      = True
+        found["source"]            = "mt5_auto_close"
+        # Also persist the journal id link if we discovered it via tier 1
+        if journal_trade_id and not found.get("journalTradeId"):
+            found["journalTradeId"] = journal_trade_id
+
+        save_trades(trades_list)
+        outcome_emoji = "\u2705" if pnl > 0 else ("\U0001f534" if pnl < 0 else "\u2796")
+        outcome_text  = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAK EVEN")
+        pnl_str       = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        ref_entry_disp = found.get("entry", planned_entry)
+        msg = (
+            f"{outcome_emoji} <b>MT5 closed — {outcome_text}</b>\n\n"
+            f"<b>{sym_upper or symbol}</b> \u2014 {direction_in or found.get('direction', '')}\n"
+            f"\U0001f4cd Entry: {ref_entry_disp} \u2192 Exit: {exit_price}\n"
+            f"\U0001f4b0 P&L: <b>{pnl_str}</b>\n"
+            f"\U0001f4ca Actual RR: <b>{actual_rr:+.2f}R</b>\n"
+            f"\u23f1 Duration: {duration_min} min\n"
+            f"\U0001f4a1 Reason: {close_reason}\n"
+            f"\U0001f517 Matched via: {match_tier}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Complete your post-trade review</a>"
+        )
+        send_telegram(msg)
+        platform_label = (found.get("platform") or found.get("source") or "mt5").upper()
+        logging.info(
+            "%s trade closed (tier=%s): #%s %s P&L=%s journal=%s",
+            platform_label, match_tier, ticket, sym_upper, pnl_str,
+            found.get("id"),
+        )
+        return jsonify({"ok": True, "match_tier": match_tier, "trade_id": found.get("id")})
+
+    # ─────────────────────────────────────────────────────────────────
+    # MISS — orphan auto-log. Persist the close as a fresh row so the
+    # user can manually link it from the journal UI.
+    # ─────────────────────────────────────────────────────────────────
+    orphan_id = "mt5_orphan_" + str(ticket)
+    market_guess = "BTC/USDT" if "BTC" in (sym_upper or "") else "Forex"
+    orphan_dir = direction_in.lower() if direction_in else ""
+    orphan = {
+        "id":              orphan_id,
+        "market":          market_guess,
+        "pair":            sym_upper or symbol,
+        "direction":       orphan_dir,
+        "timeframe":       "",
+        "setup":           "",
+        "dateOpen":        body.get("opened_at", now_iso),
+        "dateClose":       body.get("timestamp", now_iso),
+        "entry":           planned_entry or entry_price_actual,
+        "sl":              planned_sl,
+        "tp":              planned_tp,
+        "exitPrice":       exit_price,
+        "actualPnL":       pnl,
+        "actualRR":        round(actual_rr, 2),
+        "outcome":         outcome,
+        "size":            "",
+        "risk":            0,
+        "plannedRR":       0,
+        "confidence":      0,
+        "conditions":      [],
+        "rationale":       "MT5 Auto-close \u2014 no matching journal entry found. Please review and link manually.",
+        "preChart":        "",
+        "review":          "",
+        "postChart":       "",
+        "rating":          0,
+        "status":          "closed",
+        "scRespected":     None,
+        "mbmsPlayedOut":   None,
+        "htfAligned":      None,
+        "liqProperlyTaken": None,
+        "expectedVsActual": "",
+        "whatDifferently":  "",
+        "lessonLearned":    "",
+        "executionRating":  0,
+        "source":           "mt5_auto_close",
+        "platform":         "mt5",
+        "mt4Ticket":        ticket,
+        "mt5Ticket":        ticket,
+        "mt5AutoClose":     True,
+        "mt5Orphan":        True,
+        "mt5ClosedAt":      now_iso,
+        "mt5CloseReason":   close_reason,
+        "mt4CloseReason":   close_reason,
+        "mt5Pips":          pips,
+        "mt4Pips":          pips,
+        "mt5Duration":      duration_min,
+        "mt4Duration":      duration_min,
+        "mt5Slippage":      round(mt5_slippage_pips, 1),
+        "journalTradeId":   journal_trade_id or None,
+        "reviewNeeded":     True,
+        "createdAt":        now_iso,
+        "updatedAt":        now_iso,
+    }
+    trades_list.append(orphan)
     save_trades(trades_list)
 
-    # Telegram notification
-    symbol = body.get("symbol", found.get("pair", ""))
-    direction = body.get("direction", found.get("direction", ""))
-    outcome_emoji = "\u2705" if pnl > 0 else ("\U0001f534" if pnl < 0 else "\u2796")
-    outcome_text = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAK EVEN")
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-
     msg = (
-        f"{outcome_emoji} <b>Trade closed — {outcome_text}</b>\n\n"
-        f"<b>{symbol}</b> — {direction}\n"
-        f"\U0001f4cd Entry: ${entry} \u2192 Exit: ${exit_price}\n"
+        f"\u26a0\ufe0f <b>MT5 closed — orphan trade</b>\n\n"
+        f"<b>{sym_upper or symbol}</b> \u2014 {direction_in}\n"
+        f"\U0001f4cd Exit: {exit_price}\n"
         f"\U0001f4b0 P&L: <b>{pnl_str}</b>\n"
-        f"\U0001f4ca Actual RR: 1:{actual_rr:.1f}\n"
-        f"\u23f1 Duration: {body.get('duration_minutes', 0)} min\n"
-        f"\U0001f4a1 Reason: {body.get('close_reason', 'Manual')}\n\n"
-        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal to add post-trade review!</a>"
+        f"\U0001f4a1 Reason: {close_reason}\n"
+        f"Ticket: #{ticket}\n\n"
+        f"No matching journal entry was found. The close has been auto-logged "
+        f"and flagged for review.\n\n"
+        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Review and link manually</a>"
     )
     send_telegram(msg)
 
-    platform_label = (found.get("platform") or found.get("source") or "mt5").upper()
-    logging.info("%s trade closed: #%s %s P&L=%s", platform_label, body.get("ticket"), symbol, pnl_str)
-    return jsonify({"ok": True})
+    logging.info(
+        "MT5 trade closed (orphan): #%s %s P&L=%s — auto-logged as %s",
+        ticket, sym_upper or symbol, pnl_str, orphan_id,
+    )
+    return jsonify({"ok": True, "match_tier": "orphan", "trade_id": orphan_id, "auto_logged": True}), 201
 
 
 @app.route("/mt4/trade-modify", methods=["POST"])
