@@ -39,15 +39,13 @@ GIST_ID = os.environ.get("GIST_ID", "bc004e07ada6586fc4492590f80b182b")
 GIST_FILE = "trade-journal.json"
 
 # ── Exchange API credentials ──
-KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY", "")
-KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET", "")
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
 # ── Symbol mapping for multi-source APIs ──
 SYMBOL_MAP = {
-    "BTCUSDT": {"coingecko": "bitcoin", "kraken": "XBTUSD", "coincap": "bitcoin"},
-    "ETHUSDT": {"coingecko": "ethereum", "kraken": "ETHUSD", "coincap": "ethereum"},
+    "BTCUSDT": {"coingecko": "bitcoin", "coincap": "bitcoin"},
+    "ETHUSDT": {"coingecko": "ethereum", "coincap": "ethereum"},
 }
 
 POLL_INTERVAL = 60   # seconds — reduced from 30 to avoid rate limits
@@ -207,7 +205,6 @@ def _get_symbol_ids(symbol):
     """Get API-specific IDs for a symbol."""
     return SYMBOL_MAP.get(symbol.upper(), {
         "coingecko": symbol.lower().replace("usdt", ""),
-        "kraken": symbol.upper().replace("USDT", "USD"),
         "coincap": symbol.lower().replace("usdt", ""),
     })
 
@@ -226,26 +223,8 @@ def _set_cooldown(source_name, seconds=60):
     logging.warning("%s rate limited — cooling down for %ds", source_name, seconds)
 
 
-def _price_kraken(symbol):
-    """PRIMARY — Kraken (free, no rate limits on public tier)."""
-    ids = _get_symbol_ids(symbol)
-    pair = ids["kraken"]
-    r = requests.get("https://api.kraken.com/0/public/Ticker",
-                      params={"pair": pair}, timeout=10)
-    if r.status_code == 429:
-        _set_cooldown("Kraken")
-        r.raise_for_status()
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error") and len(data["error"]):
-        raise ValueError(data["error"][0])
-    result = data["result"]
-    key = list(result.keys())[0]
-    return float(result[key]["c"][0])
-
-
 def _price_coincap(symbol):
-    """BACKUP — CoinCap (free, no geo restrictions)."""
+    """PRIMARY — CoinCap (free, no geo restrictions)."""
     ids = _get_symbol_ids(symbol)
     r = requests.get(f"https://api.coincap.io/v2/assets/{ids['coincap']}", timeout=10)
     if r.status_code == 429:
@@ -256,7 +235,7 @@ def _price_coincap(symbol):
 
 
 def _price_coingecko(symbol):
-    """SECOND BACKUP — CoinGecko (strict rate limits on free tier)."""
+    """BACKUP — CoinGecko (strict rate limits on free tier)."""
     ids = _get_symbol_ids(symbol)
     r = requests.get("https://api.coingecko.com/api/v3/simple/price",
                       params={"ids": ids["coingecko"], "vs_currencies": "usd"}, timeout=10)
@@ -269,7 +248,7 @@ def _price_coingecko(symbol):
 
 
 def get_price(symbol="BTCUSDT"):
-    """Get price: check cache first, then Kraken → CoinCap → CoinGecko with cooldowns."""
+    """Get price: check cache first, then CoinCap → CoinGecko with cooldowns."""
     now = time.time()
 
     # 1. Return cached price if still fresh
@@ -279,7 +258,6 @@ def get_price(symbol="BTCUSDT"):
 
     # 2. Try sources in order, skipping any on cooldown
     sources = [
-        ("Kraken", _price_kraken),
         ("CoinCap", _price_coincap),
         ("CoinGecko", _price_coingecko),
     ]
@@ -396,12 +374,7 @@ def _test_trade_levels(symbol, direction="BUY"):
 
 
 def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
-    """Get OHLCV candle data. Tries Kraken first, falls back to CoinGecko."""
-    if _is_cooled_down("Kraken"):
-        try:
-            return _klines_kraken(symbol, interval, limit)
-        except Exception as e:
-            logging.warning("Kraken klines failed: %s — trying CoinGecko", e)
+    """Get OHLCV candle data via CoinGecko (only kline source post-Kraken removal)."""
     if _is_cooled_down("CoinGecko"):
         try:
             return _klines_coingecko(symbol, interval, limit)
@@ -433,36 +406,6 @@ def _klines_coingecko(symbol, interval, limit):
             "volume": 0,  # CoinGecko OHLC doesn't include volume
         })
     return candles[-limit:]  # trim to requested limit
-
-
-def _klines_kraken(symbol, interval, limit):
-    """Fetch OHLCV from Kraken (free, no geo restrictions)."""
-    ids = _get_symbol_ids(symbol)
-    # Map interval to Kraken minutes
-    interval_map = {
-        "1m": 1, "3m": 5, "5m": 5, "15m": 15, "30m": 30,
-        "1h": 60, "4h": 240, "1d": 1440, "1w": 10080, "1M": 21600,
-    }
-    kraken_interval = interval_map.get(interval, 1440)
-    r = requests.get("https://api.kraken.com/0/public/OHLC",
-                      params={"pair": ids["kraken"], "interval": kraken_interval}, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error") and len(data["error"]):
-        raise ValueError(data["error"][0])
-    result = data["result"]
-    key = [k for k in result.keys() if k != "last"][0]
-    candles = []
-    for k in result[key]:
-        candles.append({
-            "time": datetime.fromtimestamp(float(k[0]), tz=timezone.utc).isoformat(),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[6]),
-        })
-    return candles[-limit:]
 
 
 # ── Telegram helper ─────────────────────────────────────
@@ -1360,13 +1303,11 @@ def mt4_open_trades():
 
 
 # ═══════════════════════════════════════════════════════
-# EXCHANGE INTEGRATION — Kraken & Binance Private APIs
+# EXCHANGE INTEGRATION — Binance Private API
 # ═══════════════════════════════════════════════════════
 
 # In-memory state for exchange sync
 _exchange_status = {
-    "kraken": {"connected": False, "last_sync": None, "error": None, "disabled": False,
-               "balance_usdt": 0, "balance_btc": 0, "open_positions": 0},
     "binance": {"connected": False, "last_sync": None, "error": None, "disabled": False,
                 "balance_usdt": 0, "balance_btc": 0, "open_positions": 0},
 }
@@ -1374,38 +1315,6 @@ _exchange_status = {
 _logged_trade_ids = set()
 # Track positions already alerted for 1:5 R:R (reset on restart)
 _be_alerted_positions = set()
-
-
-# ── Kraken Private API Signing ──────────────────────────
-
-def _kraken_sign(urlpath, data):
-    """Sign a Kraken private API request using HMAC-SHA512."""
-    postdata = urlencode(data)
-    encoded = (str(data["nonce"]) + postdata).encode()
-    message = urlpath.encode() + hashlib.sha256(encoded).digest()
-    mac = hmac.new(base64.b64decode(KRAKEN_API_SECRET), message, hashlib.sha512)
-    return base64.b64encode(mac.digest()).decode()
-
-
-def _kraken_private(endpoint, extra_data=None):
-    """Make a signed Kraken private API call."""
-    if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
-        raise ValueError("Kraken API credentials not configured")
-    urlpath = f"/0/private/{endpoint}"
-    data = {"nonce": str(int(time.time() * 1000))}
-    if extra_data:
-        data.update(extra_data)
-    headers = {
-        "API-Key": KRAKEN_API_KEY,
-        "API-Sign": _kraken_sign(urlpath, data),
-    }
-    r = requests.post(f"https://api.kraken.com{urlpath}",
-                      headers=headers, data=data, timeout=15)
-    r.raise_for_status()
-    resp = r.json()
-    if resp.get("error") and len(resp["error"]):
-        raise ValueError(resp["error"][0])
-    return resp["result"]
 
 
 # ── Binance Private API Signing ─────────────────────────
@@ -1434,42 +1343,6 @@ def _binance_private(endpoint, params=None, method="GET"):
     return r.json()
 
 
-# ── Kraken Account ──────────────────────────────────────
-
-def kraken_get_balance():
-    """Fetch Kraken account balance."""
-    result = _kraken_private("Balance")
-    usdt = float(result.get("USDT", result.get("ZUSD", 0)))
-    btc = float(result.get("XXBT", result.get("XBT", 0)))
-    return {"usdt": usdt, "btc": btc}
-
-
-def kraken_get_open_orders():
-    """Fetch open orders from Kraken."""
-    result = _kraken_private("OpenOrders")
-    return result.get("open", {})
-
-
-def kraken_get_trade_history(start=None):
-    """Fetch closed trades from Kraken."""
-    extra = {}
-    if start:
-        extra["start"] = str(start)
-    result = _kraken_private("TradesHistory", extra)
-    return result.get("trades", {})
-
-
-def kraken_get_open_positions():
-    """Fetch open positions from Kraken."""
-    try:
-        result = _kraken_private("OpenPositions")
-        return result
-    except ValueError as e:
-        if "permission" in str(e).lower():
-            return {}
-        raise
-
-
 # ── Binance Account ─────────────────────────────────────
 
 def binance_get_balance():
@@ -1490,24 +1363,9 @@ def binance_get_open_orders(symbol="BTCUSDT"):
     return _binance_private("/api/v3/openOrders", {"symbol": symbol})
 
 
-# ── Symbol Normalization ────────────────────────────────
-
-def _normalize_kraken_symbol(pair):
-    """Convert Kraken pair name to standard format (e.g., XXBTZUSD → BTCUSDT)."""
-    pair = pair.upper()
-    pair = pair.replace("XXBT", "BTC").replace("XBT", "BTC")
-    pair = pair.replace("ZUSD", "USDT").replace("USD", "USDT")
-    # Avoid double USDT
-    if pair.endswith("USDTUSDT"):
-        pair = pair.replace("USDTUSDT", "USDT")
-    if pair.endswith("USDTT"):
-        pair = pair[:-1]
-    return pair
-
-
 # ── Exchange Trade to Journal Entry ─────────────────────
 
-def exchange_trade_to_journal(trade_data, source="kraken"):
+def exchange_trade_to_journal(trade_data, source="binance"):
     """Convert an exchange trade to journal format."""
     now = datetime.now(timezone.utc).isoformat()
     return {
@@ -1552,82 +1410,6 @@ def exchange_trade_to_journal(trade_data, source="kraken"):
     }
 
 
-# ── Process Kraken Trade History ────────────────────────
-
-def _process_kraken_trades():
-    """Check Kraken for new closed trades and log them."""
-    if _exchange_status["kraken"]["disabled"]:
-        return
-
-    try:
-        trades = kraken_get_trade_history()
-    except ValueError as e:
-        if "invalid" in str(e).lower() or "permission" in str(e).lower():
-            _exchange_status["kraken"]["disabled"] = True
-            _exchange_status["kraken"]["error"] = f"Auth error: {e}"
-            logging.error("Kraken auth error — disabling sync: %s", e)
-            return
-        raise
-
-    new_count = 0
-    for tid, t in trades.items():
-        if tid in _logged_trade_ids:
-            continue
-
-        # Parse Kraken trade data
-        symbol = _normalize_kraken_symbol(t.get("pair", ""))
-        direction = "long" if t.get("type") == "buy" else "short"
-        price = float(t.get("price", 0))
-        cost = float(t.get("cost", 0))
-        fee = float(t.get("fee", 0))
-        vol = float(t.get("vol", 0))
-        open_time = datetime.fromtimestamp(float(t.get("time", 0)), tz=timezone.utc).isoformat()
-
-        # For spot trades, P&L needs to be calculated differently
-        # We'll use cost - fee as a rough estimate; actual P&L comes from position close
-        pnl = float(t.get("net", 0)) if "net" in t else -(fee)
-
-        trade_data = {
-            "trade_id": tid,
-            "symbol": symbol,
-            "direction": direction,
-            "entry_price": price,
-            "exit_price": price,
-            "volume": vol,
-            "pnl": pnl,
-            "open_time": open_time,
-            "close_time": open_time,
-        }
-
-        journal_entry = exchange_trade_to_journal(trade_data, source="kraken")
-        trades_list = get_trades()
-        # Double-check no duplicate
-        if any(tr.get("id") == journal_entry["id"] for tr in trades_list):
-            _logged_trade_ids.add(tid)
-            continue
-
-        trades_list.append(journal_entry)
-        save_trades(trades_list)
-        _logged_trade_ids.add(tid)
-        new_count += 1
-
-        # Telegram notification
-        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        msg = (
-            f"\U0001f4ca <b>New Kraken trade logged!</b>\n\n"
-            f"<b>{symbol}</b> — {direction.upper()}\n"
-            f"\U0001f4cd Entry: <b>${price:.2f}</b>\n"
-            f"\U0001f4b0 P&L: <b>{pnl_str}</b>\n"
-            f"\U0001f4e6 Volume: {vol}\n\n"
-            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal to add your analysis!</a>"
-        )
-        send_telegram(msg)
-        logging.info("Kraken trade auto-logged: %s %s %s @ $%.2f", tid, symbol, direction, price)
-
-    if new_count > 0:
-        logging.info("Auto-logged %d new Kraken trade(s)", new_count)
-
-
 # ── Process Binance Trade History ───────────────────────
 
 def _process_binance_trades():
@@ -1638,7 +1420,7 @@ def _process_binance_trades():
     try:
         trades = binance_get_trade_history("BTCUSDT", 50)
     except ConnectionError:
-        _exchange_status["binance"]["error"] = "Geo-blocked — falling back to Kraken only"
+        _exchange_status["binance"]["error"] = "Geo-blocked"
         _exchange_status["binance"]["disabled"] = True
         logging.warning("Binance geo-blocked — disabling Binance sync")
         return
@@ -1705,59 +1487,6 @@ def _process_binance_trades():
 
 def _monitor_positions():
     """Check open positions for 1:5 R:R break-even alert."""
-    # Kraken positions
-    if KRAKEN_API_KEY and not _exchange_status["kraken"]["disabled"]:
-        try:
-            positions = kraken_get_open_positions()
-            _exchange_status["kraken"]["open_positions"] = len(positions)
-            for pid, pos in positions.items():
-                if pid in _be_alerted_positions:
-                    continue
-                # Check against journal entry for SL/TP
-                trades_list = get_trades()
-                entry_price = float(pos.get("cost", 0)) / max(float(pos.get("vol", 1)), 0.0001)
-                current_pnl = float(pos.get("net", 0))
-                direction = "long" if pos.get("type") == "buy" else "short"
-                symbol = _normalize_kraken_symbol(pos.get("pair", ""))
-
-                # Find matching journal entry with SL
-                matching = [t for t in trades_list if t.get("source") == "kraken"
-                           and t.get("status") == "open" and t.get("sl")]
-                sl_dist = 0
-                for m in matching:
-                    sl_dist = abs(m.get("entry", 0) - m.get("sl", 0))
-                    break
-
-                if sl_dist <= 0:
-                    continue
-
-                # Get current price for R:R calc
-                try:
-                    current_price = get_price("BTCUSDT")
-                except Exception:
-                    continue
-
-                if direction == "long":
-                    current_rr = (current_price - entry_price) / sl_dist if sl_dist > 0 else 0
-                else:
-                    current_rr = (entry_price - current_price) / sl_dist if sl_dist > 0 else 0
-
-                if current_rr >= 5:
-                    _be_alerted_positions.add(pid)
-                    msg = (
-                        f"\U0001f512 <b>KRAKEN POSITION AT 1:5 R:R!</b>\n\n"
-                        f"<b>{symbol}</b> — {direction.upper()}\n"
-                        f"Consider moving stop to break even!\n"
-                        f"\U0001f4b0 Current profit: <b>${current_pnl:.2f}</b>\n"
-                        f"\U0001f4ca R:R: 1:{current_rr:.1f}\n\n"
-                        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">View in journal</a>"
-                    )
-                    send_telegram(msg)
-                    logging.info("1:5 R:R alert sent for Kraken position %s", pid)
-
-        except Exception as e:
-            logging.warning("Kraken position monitor error: %s", e)
-
     # Binance open orders (spot doesn't have margin positions by default)
     if BINANCE_API_KEY and not _exchange_status["binance"]["disabled"]:
         try:
@@ -1776,12 +1505,9 @@ def _load_logged_trade_ids():
         for t in trades_list:
             src = t.get("source", "")
             eid = t.get("exchangeTradeId") or t.get("id", "")
-            if src in ("kraken", "binance"):
+            if src == "binance":
                 _logged_trade_ids.add(eid)
-                if src == "kraken":
-                    _logged_trade_ids.add(eid)
-                else:
-                    _logged_trade_ids.add(f"binance_{eid}")
+                _logged_trade_ids.add(f"binance_{eid}")
         logging.info("Loaded %d already-logged exchange trade IDs", len(_logged_trade_ids))
     except Exception as e:
         logging.warning("Failed to load logged trade IDs: %s", e)
@@ -1793,29 +1519,6 @@ def exchange_sync_loop():
     while True:
         time.sleep(60)
         try:
-            # Kraken sync
-            if KRAKEN_API_KEY and not _exchange_status["kraken"]["disabled"]:
-                try:
-                    bal = kraken_get_balance()
-                    _exchange_status["kraken"]["connected"] = True
-                    _exchange_status["kraken"]["balance_usdt"] = bal["usdt"]
-                    _exchange_status["kraken"]["balance_btc"] = bal["btc"]
-                    _exchange_status["kraken"]["last_sync"] = datetime.now(timezone.utc).isoformat()
-                    _exchange_status["kraken"]["error"] = None
-                    _process_kraken_trades()
-                except ValueError as e:
-                    if "invalid" in str(e).lower() or "permission" in str(e).lower():
-                        _exchange_status["kraken"]["disabled"] = True
-                        _exchange_status["kraken"]["connected"] = False
-                        _exchange_status["kraken"]["error"] = str(e)
-                        logging.error("Kraken disabled due to auth error: %s", e)
-                    else:
-                        _exchange_status["kraken"]["error"] = str(e)
-                        logging.warning("Kraken sync error: %s", e)
-                except Exception as e:
-                    _exchange_status["kraken"]["error"] = str(e)
-                    logging.warning("Kraken sync error: %s", e)
-
             # Binance sync
             if BINANCE_API_KEY and not _exchange_status["binance"]["disabled"]:
                 try:
@@ -1846,109 +1549,6 @@ def exchange_sync_loop():
 
 
 # ── Exchange API Routes ─────────────────────────────────
-
-@app.route("/kraken/account", methods=["GET"])
-def kraken_account():
-    """GET /kraken/account — account balance, open positions, recent trades."""
-    if not KRAKEN_API_KEY:
-        return jsonify({"error": "Kraken API not configured"}), 400
-    if _exchange_status["kraken"]["disabled"]:
-        return jsonify({"error": _exchange_status["kraken"]["error"], "disabled": True}), 403
-
-    try:
-        balance = kraken_get_balance()
-        open_orders = kraken_get_open_orders()
-        trades = kraken_get_trade_history()
-
-        # Format recent trades (last 50)
-        recent = []
-        for tid, t in list(trades.items())[:50]:
-            recent.append({
-                "id": tid,
-                "symbol": _normalize_kraken_symbol(t.get("pair", "")),
-                "direction": "Long" if t.get("type") == "buy" else "Short",
-                "price": float(t.get("price", 0)),
-                "volume": float(t.get("vol", 0)),
-                "cost": float(t.get("cost", 0)),
-                "fee": float(t.get("fee", 0)),
-                "time": datetime.fromtimestamp(float(t.get("time", 0)), tz=timezone.utc).isoformat(),
-            })
-
-        return jsonify({
-            "connected": True,
-            "balance_usdt": balance["usdt"],
-            "balance_btc": balance["btc"],
-            "open_orders": len(open_orders),
-            "recent_trades": recent,
-            "last_sync": datetime.now(timezone.utc).isoformat(),
-        })
-    except ValueError as e:
-        if "invalid" in str(e).lower() or "permission" in str(e).lower():
-            _exchange_status["kraken"]["disabled"] = True
-            _exchange_status["kraken"]["error"] = str(e)
-        return jsonify({"error": str(e)}), 401
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/kraken/positions", methods=["GET"])
-def kraken_positions():
-    """GET /kraken/positions — open positions with current P&L and R:R."""
-    if not KRAKEN_API_KEY:
-        return jsonify({"error": "Kraken API not configured"}), 400
-    if _exchange_status["kraken"]["disabled"]:
-        return jsonify({"error": _exchange_status["kraken"]["error"], "disabled": True}), 403
-
-    try:
-        positions = kraken_get_open_positions()
-        current_price = get_price("BTCUSDT")
-        result = []
-
-        for pid, pos in positions.items():
-            vol = max(float(pos.get("vol", 0)), 0.0001)
-            entry_price = float(pos.get("cost", 0)) / vol
-            direction = "Long" if pos.get("type") == "buy" else "Short"
-            symbol = _normalize_kraken_symbol(pos.get("pair", ""))
-            current_pnl = float(pos.get("net", 0))
-            open_time = datetime.fromtimestamp(float(pos.get("time", 0)), tz=timezone.utc).isoformat()
-
-            # Calculate R:R from journal entry if SL/TP set
-            trades_list = get_trades()
-            sl = 0
-            tp = 0
-            current_rr = 0
-            for t in trades_list:
-                if t.get("source") == "kraken" and t.get("status") == "open":
-                    sl = t.get("sl", 0)
-                    tp = t.get("tp", 0)
-                    break
-
-            sl_dist = abs(entry_price - sl) if sl else 0
-            if sl_dist > 0:
-                if direction == "Long":
-                    current_rr = (current_price - entry_price) / sl_dist
-                else:
-                    current_rr = (entry_price - current_price) / sl_dist
-
-            elapsed = time.time() - float(pos.get("time", time.time()))
-            result.append({
-                "id": pid,
-                "symbol": symbol,
-                "direction": direction,
-                "entry_price": round(entry_price, 2),
-                "current_price": round(current_price, 2),
-                "current_pnl": round(current_pnl, 2),
-                "current_rr": round(max(current_rr, 0), 2),
-                "volume": float(pos.get("vol", 0)),
-                "open_time": open_time,
-                "time_open_minutes": int(elapsed / 60),
-                "sl": sl, "tp": tp,
-            })
-
-        return jsonify({"positions": result, "count": len(result)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 
 @app.route("/exchange/status", methods=["GET"])
 def exchange_status():
@@ -3205,11 +2805,9 @@ def _get_gist_data():
 def _start_background_threads():
     """Start all background threads."""
     threading.Thread(target=price_monitor_loop, daemon=True).start()
-    if KRAKEN_API_KEY or BINANCE_API_KEY:
+    if BINANCE_API_KEY:
         threading.Thread(target=exchange_sync_loop, daemon=True).start()
-        logging.info("Exchange sync started — Kraken: %s, Binance: %s",
-                     "enabled" if KRAKEN_API_KEY else "disabled",
-                     "enabled" if BINANCE_API_KEY else "disabled")
+        logging.info("Exchange sync started — Binance: enabled")
     threading.Thread(target=daily_summary_loop, daemon=True).start()
 
 
