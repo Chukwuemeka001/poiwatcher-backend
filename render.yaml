@@ -22,6 +22,14 @@ services:
         sync: false
       - key: BINANCE_API_SECRET
         sync: false
+      - key: BITUNIX_API_KEY
+        sync: false
+      - key: BITUNIX_API_SECRET
+        sync: false
+      - key: BITUNIX_DEFAULT_LEVERAGE
+        value: "10"
+      - key: BITUNIX_MARGIN_MODE
+        value: "CROSS"
       - key: EXECUTION_API_KEY
         sync: false
       - key: PAPER_TRADING_MODE

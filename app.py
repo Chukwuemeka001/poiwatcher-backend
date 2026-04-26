@@ -14,6 +14,7 @@ import hmac
 import base64
 import threading
 import logging
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
@@ -41,6 +42,13 @@ GIST_FILE = "trade-journal.json"
 # ── Exchange API credentials ──
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+
+# ── Bitunix Futures (primary crypto futures venue) ──
+BITUNIX_API_KEY = os.environ.get("BITUNIX_API_KEY", "")
+BITUNIX_API_SECRET = os.environ.get("BITUNIX_API_SECRET", "")
+BITUNIX_DEFAULT_LEVERAGE = int(os.environ.get("BITUNIX_DEFAULT_LEVERAGE", "10") or "10")
+BITUNIX_MARGIN_MODE = (os.environ.get("BITUNIX_MARGIN_MODE", "CROSS") or "CROSS").upper()
+BITUNIX_BASE_URL = "https://fapi.bitunix.com"
 
 # ── Symbol mapping for multi-source APIs ──
 SYMBOL_MAP = {
@@ -248,7 +256,12 @@ def _price_coingecko(symbol):
 
 
 def get_price(symbol="BTCUSDT"):
-    """Get price: check cache first, then CoinCap → CoinGecko with cooldowns."""
+    """Get price: check cache first, then Bitunix → CoinGecko → CoinCap with cooldowns.
+
+    Bitunix is the PRIMARY source because we trade against its order book; using
+    its own ticker minimises any cross-venue spread when the journal app shows
+    a live price. Falls back through CoinGecko, then CoinCap as last resort.
+    """
     now = time.time()
 
     # 1. Return cached price if still fresh
@@ -258,8 +271,9 @@ def get_price(symbol="BTCUSDT"):
 
     # 2. Try sources in order, skipping any on cooldown
     sources = [
-        ("CoinCap", _price_coincap),
+        ("Bitunix",   _price_bitunix),
         ("CoinGecko", _price_coingecko),
+        ("CoinCap",   _price_coincap),
     ]
     last_err = None
     for name, fn in sources:
@@ -282,6 +296,16 @@ def get_price(symbol="BTCUSDT"):
         return cached["price"]
 
     raise RuntimeError(f"All price sources failed for {symbol}: {last_err}")
+
+
+def get_btc_price():
+    """Convenience wrapper for BTCUSDT price."""
+    return get_price("BTCUSDT")
+
+
+def get_eth_price():
+    """Convenience wrapper for ETHUSDT price (same fallback chain)."""
+    return get_price("ETHUSDT")
 
 
 def _get_forex_price(symbol):
@@ -1310,7 +1334,15 @@ def mt4_open_trades():
 _exchange_status = {
     "binance": {"connected": False, "last_sync": None, "error": None, "disabled": False,
                 "balance_usdt": 0, "balance_btc": 0, "open_positions": 0},
+    "bitunix": {"connected": False, "last_sync": None, "error": None, "disabled": False,
+                "balance_usdt": 0, "available_usdt": 0, "equity_usdt": 0, "open_positions": 0,
+                "open_orders": 0},
 }
+# Per-symbol cache so we only call set_leverage / set_margin_mode the first time
+# a venue/symbol pair is used in a session
+_bitunix_symbol_setup = set()
+# Positions where SL has already been moved to entry (1:5 R:R)
+_bitunix_be_alerted = set()
 # Track already-logged trade IDs to avoid duplicates (loaded from Gist)
 _logged_trade_ids = set()
 # Track positions already alerted for 1:5 R:R (reset on restart)
@@ -1503,11 +1535,17 @@ def _load_logged_trade_ids():
     try:
         trades_list = get_trades()
         for t in trades_list:
-            src = t.get("source", "")
+            src = (t.get("source") or "").lower()
             eid = t.get("exchangeTradeId") or t.get("id", "")
             if src == "binance":
                 _logged_trade_ids.add(eid)
                 _logged_trade_ids.add(f"binance_{eid}")
+            elif src in ("bitunix", "bitunix_auto_close"):
+                _logged_trade_ids.add(eid)
+                _logged_trade_ids.add(f"bitunix_{eid}")
+                bo = t.get("bitunixOrderId")
+                if bo:
+                    _logged_trade_ids.add(f"bitunix_{bo}")
         logging.info("Loaded %d already-logged exchange trade IDs", len(_logged_trade_ids))
     except Exception as e:
         logging.warning("Failed to load logged trade IDs: %s", e)
@@ -1540,6 +1578,30 @@ def exchange_sync_loop():
                         _exchange_status["binance"]["connected"] = False
                     _exchange_status["binance"]["error"] = str(e)
                     logging.warning("Binance sync error: %s", e)
+
+            # Bitunix sync (primary crypto futures venue)
+            if BITUNIX_API_KEY and not _exchange_status["bitunix"]["disabled"]:
+                try:
+                    bal = bitunix_get_balance()
+                    _exchange_status["bitunix"]["connected"]      = True
+                    _exchange_status["bitunix"]["balance_usdt"]   = bal["balance"]
+                    _exchange_status["bitunix"]["available_usdt"] = bal["available"]
+                    _exchange_status["bitunix"]["equity_usdt"]    = bal["equity"]
+                    _exchange_status["bitunix"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+                    _exchange_status["bitunix"]["error"]          = None
+                    bitunix_trade_close_monitor()
+                    bitunix_position_monitor()
+                except ConnectionError:
+                    _exchange_status["bitunix"]["disabled"]  = True
+                    _exchange_status["bitunix"]["connected"] = False
+                    _exchange_status["bitunix"]["error"]     = "Geo-blocked"
+                    logging.warning("Bitunix geo-blocked — disabled")
+                except Exception as e:
+                    if "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "invalid api" in str(e).lower():
+                        _exchange_status["bitunix"]["disabled"]  = True
+                        _exchange_status["bitunix"]["connected"] = False
+                    _exchange_status["bitunix"]["error"] = str(e)
+                    logging.warning("Bitunix sync error: %s", e)
 
             # Monitor open positions for 1:5 R:R
             _monitor_positions()
@@ -1580,6 +1642,941 @@ def binance_account():
         return jsonify({"error": "Binance geo-blocked"}), 403
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════
+# BITUNIX FUTURES — Private API (primary crypto venue)
+# ═══════════════════════════════════════════════════════
+
+# Per-venue kill switch — separate from _mt4_emergency_stop
+_bitunix_emergency_stop = False
+
+# ── Rate limiter: max 10 requests/second ────────────────
+_bitunix_call_times = deque(maxlen=20)
+_bitunix_lock = threading.Lock()
+
+
+def _bitunix_rate_limit():
+    """Block until we're under 10 requests/second to Bitunix."""
+    with _bitunix_lock:
+        now = time.time()
+        # Drop entries older than 1s
+        while _bitunix_call_times and now - _bitunix_call_times[0] > 1.0:
+            _bitunix_call_times.popleft()
+        if len(_bitunix_call_times) >= 10:
+            sleep_for = 1.0 - (now - _bitunix_call_times[0]) + 0.01
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        _bitunix_call_times.append(time.time())
+
+
+def _bitunix_query_string(params):
+    """Build the Bitunix-canonical queryParams string for signing.
+
+    Per Bitunix docs: keys sorted ASCII, concatenated as key1value1key2value2
+    with NO '=' or '&' separators. Empty params = empty string.
+    """
+    if not params:
+        return ""
+    parts = []
+    for k in sorted(params.keys()):
+        v = params[k]
+        if v is None:
+            continue
+        parts.append(f"{k}{v}")
+    return "".join(parts)
+
+
+def _bitunix_sign(nonce, timestamp, query_string, body_string):
+    """Bitunix double-SHA256 signing.
+
+    digestInput = nonce + timestamp + apiKey + queryParams + body
+    digest      = sha256_hex(digestInput)
+    signInput   = digest + secretKey
+    sign        = sha256_hex(signInput)
+    """
+    digest_input = f"{nonce}{timestamp}{BITUNIX_API_KEY}{query_string}{body_string}"
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+    sign_input = f"{digest}{BITUNIX_API_SECRET}"
+    return hashlib.sha256(sign_input.encode("utf-8")).hexdigest()
+
+
+def _bitunix_request(method, path, params=None, body=None, signed=True):
+    """Make a (signed) request to Bitunix futures API.
+
+    Returns parsed JSON response (the full envelope: {code, msg, data}).
+    Raises ConnectionError on HTTP 451/403, RuntimeError on auth failure,
+    ValueError if credentials are missing.
+    """
+    if signed and (not BITUNIX_API_KEY or not BITUNIX_API_SECRET):
+        raise ValueError("Bitunix API credentials not configured")
+
+    _bitunix_rate_limit()
+
+    method = method.upper()
+    params = params or {}
+    # Body must be JSON with all spaces removed; identical bytes signed and sent
+    if body is None:
+        body_string = ""
+    else:
+        body_string = json.dumps(body, separators=(",", ":"), sort_keys=False)
+
+    query_string = _bitunix_query_string(params)
+
+    headers = {"Content-Type": "application/json", "language": "en-US"}
+    if signed:
+        nonce = uuid.uuid4().hex
+        timestamp = str(int(time.time() * 1000))
+        sign = _bitunix_sign(nonce, timestamp, query_string, body_string)
+        headers.update({
+            "api-key":   BITUNIX_API_KEY,
+            "sign":      sign,
+            "nonce":     nonce,
+            "timestamp": timestamp,
+        })
+
+    # Build URL — use standard urlencoded query for the wire request
+    url = BITUNIX_BASE_URL + path
+    if params:
+        url = url + "?" + urlencode({k: v for k, v in params.items() if v is not None})
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        else:
+            r = requests.request(method, url, headers=headers, data=body_string.encode("utf-8"), timeout=15)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Bitunix request failed: {e}") from e
+
+    if r.status_code in (451, 403):
+        raise ConnectionError("Bitunix geo-blocked or forbidden")
+    r.raise_for_status()
+
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise RuntimeError(f"Bitunix returned non-JSON: {r.text[:200]}") from e
+
+    code = data.get("code")
+    if code != 0:
+        msg = data.get("msg") or data.get("message") or "Unknown error"
+        # Auth-style errors → propagate so caller can disable integration
+        if code in (10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008,
+                    10009, 10010, 10011, 10012):
+            raise RuntimeError(f"Bitunix auth error (code {code}): {msg}")
+        raise RuntimeError(f"Bitunix API error (code {code}): {msg}")
+
+    return data
+
+
+# ── Bitunix Read APIs ───────────────────────────────────
+
+def bitunix_get_balance(margin_coin="USDT"):
+    """Fetch Bitunix futures account balance for the given margin coin."""
+    resp = _bitunix_request("GET", "/api/v1/futures/account", params={"marginCoin": margin_coin})
+    d = resp.get("data") or {}
+    return {
+        "margin_coin": d.get("marginCoin", margin_coin),
+        "balance":     float(d.get("margin", 0) or 0) + float(d.get("available", 0) or 0),
+        "available":   float(d.get("available", 0) or 0),
+        "margin":      float(d.get("margin", 0) or 0),
+        "equity":      float(d.get("equity", 0) or 0),
+        "unrealized":  float(d.get("unrealizedPNL", d.get("unrealizedPnl", 0)) or 0),
+        "raw":         d,
+    }
+
+
+def bitunix_get_ticker(symbol="BTCUSDT"):
+    """Fetch latest ticker for a symbol — public endpoint, no signing."""
+    resp = _bitunix_request("GET", "/api/v1/futures/market/tickers",
+                             params={"symbols": symbol}, signed=False)
+    items = resp.get("data") or []
+    if not items:
+        raise RuntimeError(f"Bitunix ticker: no data for {symbol}")
+    t = items[0] if isinstance(items, list) else items
+    return {
+        "symbol":    t.get("symbol", symbol),
+        "last":      float(t.get("lastPrice", t.get("last", 0)) or 0),
+        "bid":       float(t.get("bidPrice", t.get("bid", 0)) or 0),
+        "ask":       float(t.get("askPrice", t.get("ask", 0)) or 0),
+        "high":      float(t.get("high24h", t.get("high", 0)) or 0),
+        "low":       float(t.get("low24h", t.get("low", 0)) or 0),
+        "volume":    float(t.get("baseVol", t.get("volume", 0)) or 0),
+        "raw":       t,
+    }
+
+
+def bitunix_get_positions(symbol=None):
+    """Fetch all currently-open Bitunix positions."""
+    params = {"symbol": symbol} if symbol else None
+    resp = _bitunix_request("GET", "/api/v1/futures/position/get_pending_positions", params=params)
+    return resp.get("data") or []
+
+
+def bitunix_get_open_orders(symbol=None):
+    """Fetch all currently-pending Bitunix limit/stop orders."""
+    params = {"symbol": symbol} if symbol else None
+    resp = _bitunix_request("GET", "/api/v1/futures/trade/get_pending_orders", params=params)
+    d = resp.get("data") or {}
+    if isinstance(d, dict):
+        return d.get("orderList") or d.get("list") or []
+    return d or []
+
+
+def bitunix_get_trade_history(symbol=None, start_time=None, end_time=None, limit=50):
+    """Fetch executed trade history."""
+    params = {"limit": limit}
+    if symbol:
+        params["symbol"] = symbol
+    if start_time:
+        params["startTime"] = int(start_time)
+    if end_time:
+        params["endTime"] = int(end_time)
+    resp = _bitunix_request("GET", "/api/v1/futures/trade/get_history_trades", params=params)
+    d = resp.get("data") or {}
+    if isinstance(d, dict):
+        return d.get("tradeList") or d.get("list") or []
+    return d or []
+
+
+# ── Bitunix Write APIs (orders + position management) ──
+
+def bitunix_set_leverage(symbol, leverage, margin_coin="USDT"):
+    """Set leverage for a symbol. Idempotent — safe to call repeatedly."""
+    body = {"symbol": symbol, "marginCoin": margin_coin, "leverage": str(int(leverage))}
+    return _bitunix_request("POST", "/api/v1/futures/account/change_leverage", body=body)
+
+
+def bitunix_set_margin_mode(symbol, mode="CROSS", margin_coin="USDT"):
+    """Set margin mode (CROSS or ISOLATION)."""
+    mode = (mode or "CROSS").upper()
+    if mode == "ISOLATED":
+        mode = "ISOLATION"
+    body = {"symbol": symbol, "marginCoin": margin_coin, "marginMode": mode}
+    return _bitunix_request("POST", "/api/v1/futures/account/change_margin_mode", body=body)
+
+
+def bitunix_ensure_symbol_setup(symbol, leverage=None, margin_mode=None):
+    """First-time-per-session leverage + margin-mode setup for a symbol."""
+    cache_key = f"{symbol}:{leverage}:{margin_mode}"
+    if cache_key in _bitunix_symbol_setup:
+        return
+    lev = int(leverage or BITUNIX_DEFAULT_LEVERAGE)
+    mode = (margin_mode or BITUNIX_MARGIN_MODE).upper()
+    try:
+        bitunix_set_margin_mode(symbol, mode)
+    except Exception as e:
+        logging.warning("Bitunix set_margin_mode(%s, %s) failed: %s", symbol, mode, e)
+    try:
+        bitunix_set_leverage(symbol, lev)
+    except Exception as e:
+        logging.warning("Bitunix set_leverage(%s, %d) failed: %s", symbol, lev, e)
+    _bitunix_symbol_setup.add(cache_key)
+
+
+def bitunix_place_order(symbol, side, qty, order_type="MARKET", price=None,
+                        client_id=None, tp_price=None, sl_price=None,
+                        trade_side="OPEN", reduce_only=False, effect="GTC",
+                        margin_coin="USDT"):
+    """Place a futures order on Bitunix.
+
+    side       — BUY / SELL
+    order_type — MARKET / LIMIT
+    trade_side — OPEN / CLOSE (one-way mode uses OPEN for new + CLOSE to close)
+    client_id  — passed as clientId; we use the journal_trade_id so we can
+                 match closes back to the journal row later.
+    tp_price/sl_price — optional take-profit / stop-loss; both use LAST_PRICE
+                       trigger by default.
+    """
+    body = {
+        "symbol":     symbol,
+        "side":       side.upper(),
+        "orderType":  order_type.upper(),
+        "qty":        str(qty),
+        "tradeSide":  trade_side.upper(),
+        "reduceOnly": bool(reduce_only),
+        "effect":     effect.upper(),
+        "marginCoin": margin_coin,
+    }
+    if order_type.upper() == "LIMIT" and price is not None:
+        body["price"] = str(price)
+    if client_id:
+        body["clientId"] = str(client_id)
+    if tp_price is not None:
+        body["tpPrice"] = str(tp_price)
+        body["tpStopType"] = "LAST_PRICE"
+    if sl_price is not None:
+        body["slPrice"] = str(sl_price)
+        body["slStopType"] = "LAST_PRICE"
+
+    return _bitunix_request("POST", "/api/v1/futures/trade/place_order", body=body)
+
+
+def bitunix_cancel_order(symbol, order_id=None, client_id=None):
+    """Cancel a pending order by orderId or clientId."""
+    if not order_id and not client_id:
+        raise ValueError("Must provide order_id or client_id")
+    order_entry = {}
+    if order_id:
+        order_entry["orderId"] = str(order_id)
+    if client_id:
+        order_entry["clientId"] = str(client_id)
+    body = {"symbol": symbol, "orderList": [order_entry]}
+    return _bitunix_request("POST", "/api/v1/futures/trade/cancel_orders", body=body)
+
+
+def bitunix_modify_position_sl(symbol, position_id, new_sl, new_tp=None):
+    """Modify a position's stop-loss (and optionally take-profit)."""
+    body = {
+        "symbol":     symbol,
+        "positionId": str(position_id),
+        "slPrice":    str(new_sl),
+        "slStopType": "LAST_PRICE",
+    }
+    if new_tp is not None:
+        body["tpPrice"] = str(new_tp)
+        body["tpStopType"] = "LAST_PRICE"
+    return _bitunix_request("POST", "/api/v1/futures/tpsl/modify_position_tp_sl", body=body)
+
+
+# ── Bitunix Price Source (for get_price chain) ─────────
+
+def _price_bitunix(symbol):
+    """PRIMARY price source — Bitunix public ticker."""
+    t = bitunix_get_ticker(symbol)
+    px = t.get("last") or 0
+    if not px or px <= 0:
+        raise RuntimeError(f"Bitunix returned invalid price for {symbol}: {px}")
+    return float(px)
+
+
+# ── Bitunix Position Monitor (1:5 R:R Break Even) ──────
+
+def bitunix_position_monitor():
+    """Auto-move SL to entry once a Bitunix position reaches 1:5 R:R."""
+    if _exchange_status["bitunix"]["disabled"] or not BITUNIX_API_KEY:
+        return
+    try:
+        positions = bitunix_get_positions()
+    except ConnectionError:
+        return
+    except Exception as e:
+        logging.warning("Bitunix position monitor — fetch failed: %s", e)
+        return
+
+    _exchange_status["bitunix"]["open_positions"] = len(positions)
+
+    for p in positions:
+        try:
+            pos_id  = str(p.get("positionId", ""))
+            symbol  = p.get("symbol", "")
+            side    = (p.get("side") or "").upper()  # BUY (long) or SELL (short)
+            entry   = float(p.get("avgOpenPrice", p.get("entryValue", 0)) or 0)
+            sl_price = float(p.get("slPrice", 0) or 0) if p.get("slPrice") else 0
+            mark     = float(p.get("markPrice", p.get("lastPrice", 0)) or 0)
+            client_id = p.get("clientId") or ""
+
+            if not pos_id or not entry or not mark or not sl_price:
+                continue
+            if pos_id in _bitunix_be_alerted:
+                continue
+
+            # R-distance = entry - SL (long) or SL - entry (short)
+            if side == "BUY":
+                r_dist = entry - sl_price
+                progress = (mark - entry)
+            else:
+                r_dist = sl_price - entry
+                progress = (entry - mark)
+            if r_dist <= 0:
+                continue
+
+            rr = progress / r_dist
+            if rr < 5.0:
+                continue
+
+            # Already at 1:5 R:R — move SL to entry
+            try:
+                bitunix_modify_position_sl(symbol, pos_id, entry)
+                _bitunix_be_alerted.add(pos_id)
+            except Exception as e:
+                logging.warning("Bitunix BE modify failed for %s: %s", pos_id, e)
+                continue
+
+            # Patch the journal row if we can match by clientId/journal_trade_id
+            try:
+                if client_id:
+                    trades_list = get_trades()
+                    for t in trades_list:
+                        if t.get("id") == client_id or t.get("journalTradeId") == client_id:
+                            t["breakEvenSet"]   = True
+                            t["bitunixBEAt"]    = datetime.now(timezone.utc).isoformat()
+                            t["updatedAt"]      = t["bitunixBEAt"]
+                            break
+                    save_trades(trades_list)
+            except Exception as e:
+                logging.warning("Bitunix BE journal patch failed: %s", e)
+
+            msg = (
+                f"\U0001f512 <b>Break even set on Bitunix!</b>\n\n"
+                f"<b>{symbol}</b> {side} reached 1:5 R:R\n"
+                f"\U0001f4cd Entry: {entry}\n"
+                f"\U0001f4ca Mark: {mark} (R = {rr:.2f})\n"
+                f"SL moved to entry — risk eliminated \u2705\n\n"
+                f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+            )
+            send_telegram(msg)
+            logging.info("Bitunix BE set on position %s %s @ entry=%s mark=%s", pos_id, symbol, entry, mark)
+        except Exception as e:
+            logging.warning("Bitunix position monitor — per-position error: %s", e)
+
+
+# ── Bitunix Trade Close Monitor (3-tier match) ─────────
+
+def _bitunix_match_journal_row(trades_list, trade):
+    """Return (row, tier) for a Bitunix close, mirroring the MT5 3-tier match.
+
+    Tier 1: by clientId / journal_trade_id
+    Tier 2: by exchange orderId / id
+    Tier 3: fuzzy — same symbol, same UTC date, entry within 0.5%
+    """
+    client_id = str(trade.get("clientId") or "")
+    order_id  = str(trade.get("orderId") or trade.get("id") or "")
+    symbol    = trade.get("symbol", "")
+    entry     = float(trade.get("avgPrice", trade.get("price", 0)) or 0)
+
+    # TIER 1 — clientId / journal_trade_id
+    if client_id:
+        for t in trades_list:
+            if t.get("id") == client_id or t.get("journalTradeId") == client_id:
+                return t, "client_id"
+
+    # TIER 2 — orderId
+    if order_id:
+        legacy_id = f"bitunix_{order_id}"
+        for t in trades_list:
+            if (t.get("id") == legacy_id
+                or str(t.get("bitunixOrderId") or "") == order_id
+                or str(t.get("exchangeTradeId") or "") == order_id):
+                return t, "order_id"
+
+    # TIER 3 — fuzzy
+    if symbol and entry:
+        ctime_ms = trade.get("ctime") or trade.get("createTime") or trade.get("time")
+        try:
+            close_dt = datetime.fromtimestamp(int(ctime_ms) / 1000, tz=timezone.utc) if ctime_ms else None
+        except (ValueError, TypeError):
+            close_dt = None
+        for t in trades_list:
+            if t.get("status") != "open":
+                continue
+            if (t.get("pair") or t.get("symbol") or "").upper() != symbol.upper():
+                continue
+            t_entry = float(t.get("entry") or 0)
+            if not t_entry:
+                continue
+            if abs(t_entry - entry) / entry > 0.005:
+                continue
+            if close_dt:
+                t_open = t.get("dateOpen", "")
+                try:
+                    o_dt = datetime.fromisoformat(t_open.replace("Z", "+00:00"))
+                    if o_dt.tzinfo is None:
+                        o_dt = o_dt.replace(tzinfo=timezone.utc)
+                    if o_dt.date() != close_dt.date():
+                        continue
+                except (ValueError, AttributeError):
+                    continue
+            return t, "fuzzy"
+    return None, None
+
+
+def bitunix_trade_close_monitor():
+    """Pick up newly-closed Bitunix trades and reconcile them with journal rows."""
+    if _exchange_status["bitunix"]["disabled"] or not BITUNIX_API_KEY:
+        return
+
+    try:
+        # Look back ~1h to catch anything missed during a brief outage
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - 60 * 60 * 1000
+        history = bitunix_get_trade_history(start_time=start_ms, end_time=end_ms, limit=50)
+    except ConnectionError:
+        _exchange_status["bitunix"]["disabled"] = True
+        _exchange_status["bitunix"]["error"] = "Geo-blocked"
+        return
+    except Exception as e:
+        if "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "invalid api" in str(e).lower():
+            _exchange_status["bitunix"]["disabled"] = True
+            _exchange_status["bitunix"]["error"] = f"Auth error: {e}"
+            logging.error("Bitunix auth error — disabling: %s", e)
+            return
+        logging.warning("Bitunix history fetch failed: %s", e)
+        return
+
+    if not history:
+        return
+
+    trades_list = get_trades()
+    new_count = 0
+
+    for t in history:
+        # Only consider closing fills (reduceOnly / tradeSide=CLOSE / position closed)
+        trade_side = (t.get("tradeSide") or t.get("positionSide") or "").upper()
+        reduce_only = bool(t.get("reduceOnly") or False)
+        is_close = reduce_only or trade_side in ("CLOSE", "CLOSE_LONG", "CLOSE_SHORT")
+        if not is_close:
+            continue
+
+        order_id = str(t.get("orderId") or t.get("tradeId") or t.get("id") or "")
+        if not order_id:
+            continue
+        dedupe_key = f"bitunix_{order_id}"
+        if dedupe_key in _logged_trade_ids:
+            continue
+
+        client_id = str(t.get("clientId") or "")
+        symbol    = t.get("symbol", "")
+        side_raw  = (t.get("side") or t.get("positionSide") or "").upper()
+        # On Bitunix the closing side is opposite of the position direction
+        # — convert back to the original direction
+        if "LONG" in trade_side or side_raw == "SELL":
+            direction = "long"
+        elif "SHORT" in trade_side or side_raw == "BUY":
+            direction = "short"
+        else:
+            direction = (t.get("originalSide") or "").lower() or ""
+
+        exit_price = float(t.get("avgPrice", t.get("price", 0)) or 0)
+        pnl        = float(t.get("realizedPNL", t.get("realizedPnl", 0)) or 0)
+        ctime_ms   = t.get("ctime") or t.get("createTime") or t.get("time") or int(time.time() * 1000)
+        try:
+            close_iso = datetime.fromtimestamp(int(ctime_ms) / 1000, tz=timezone.utc).isoformat()
+        except (ValueError, TypeError):
+            close_iso = datetime.now(timezone.utc).isoformat()
+
+        # 3-tier match
+        normalised = {
+            "clientId": client_id, "orderId": order_id, "symbol": symbol,
+            "avgPrice": exit_price, "ctime": ctime_ms,
+        }
+        found, tier = _bitunix_match_journal_row(trades_list, normalised)
+
+        if found:
+            entry_price = float(found.get("entry") or 0)
+            risk = float(found.get("risk") or 0)
+            sl_price = float(found.get("sl") or 0)
+            r_dist = abs(entry_price - sl_price) if sl_price else 0
+            actual_rr = (abs(exit_price - entry_price) / r_dist) if r_dist else 0
+            if direction == "short":
+                actual_rr = -actual_rr if exit_price > entry_price else actual_rr
+            else:
+                actual_rr = -actual_rr if exit_price < entry_price else actual_rr
+
+            outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "be")
+
+            found["status"]          = "closed"
+            found["exitPrice"]       = exit_price
+            found["actualPnL"]       = pnl
+            found["dateClose"]       = close_iso
+            found["actualRR"]        = actual_rr
+            found["outcome"]         = outcome
+            found["bitunixOrderId"]  = order_id
+            found["bitunixAutoClose"]= True
+            found["bitunixMatchTier"]= tier
+            found["reviewNeeded"]    = True
+            found["source"]          = "bitunix_auto_close"
+            found["updatedAt"]       = datetime.now(timezone.utc).isoformat()
+        else:
+            # Persist as a fresh auto-logged row
+            trade_data = {
+                "trade_id":    order_id,
+                "symbol":      symbol,
+                "direction":   direction or "long",
+                "entry_price": exit_price,
+                "exit_price":  exit_price,
+                "volume":      float(t.get("qty", 0) or 0),
+                "pnl":         pnl,
+                "open_time":   close_iso,
+                "close_time":  close_iso,
+            }
+            row = exchange_trade_to_journal(trade_data, source="bitunix")
+            row["bitunixOrderId"]   = order_id
+            row["bitunixAutoClose"] = True
+            row["bitunixMatchTier"] = "no_match"
+            row["reviewNeeded"]     = True
+            trades_list.append(row)
+
+        _logged_trade_ids.add(dedupe_key)
+        new_count += 1
+
+        outcome_str = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
+        msg = (
+            f"\U0001f4ca <b>Trade closed on Bitunix!</b>  [{outcome_str}]\n\n"
+            f"<b>{symbol}</b> {direction.upper() if direction else ''}\n"
+            f"\U0001f4cd Exit: <b>{exit_price}</b>\n"
+            f"\U0001f4b0 P&amp;L: <b>${pnl:.2f}</b>\n"
+            f"Match: <code>{tier or 'no_match'}</code>\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Review in journal</a>"
+        )
+        send_telegram(msg)
+        logging.info("Bitunix close logged: %s %s exit=%s pnl=%s match=%s",
+                     order_id, symbol, exit_price, pnl, tier or "no_match")
+
+    if new_count > 0:
+        try:
+            save_trades(trades_list)
+        except Exception as e:
+            logging.error("Bitunix close monitor — Gist save failed: %s", e)
+        logging.info("Auto-logged %d new Bitunix close(s)", new_count)
+
+
+# ── Bitunix Flask Routes ───────────────────────────────
+
+@app.route("/bitunix/exchange/status", methods=["GET"])
+def bitunix_exchange_status():
+    """GET /bitunix/exchange/status — connection state for Bitunix only."""
+    return jsonify(_exchange_status.get("bitunix", {}))
+
+
+@app.route("/bitunix/account", methods=["GET"])
+def bitunix_account():
+    """GET /bitunix/account — balance + open position/order counts."""
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+    if _exchange_status["bitunix"]["disabled"]:
+        return jsonify({"error": _exchange_status["bitunix"]["error"], "disabled": True}), 403
+    try:
+        balance = bitunix_get_balance()
+        positions = bitunix_get_positions()
+        orders = bitunix_get_open_orders()
+        return jsonify({
+            "connected":      True,
+            "balance_usdt":   balance["balance"],
+            "available_usdt": balance["available"],
+            "equity_usdt":    balance["equity"],
+            "open_positions": len(positions),
+            "open_orders":    len(orders),
+            "leverage":       BITUNIX_DEFAULT_LEVERAGE,
+            "margin_mode":    BITUNIX_MARGIN_MODE,
+            "last_sync":      datetime.now(timezone.utc).isoformat(),
+        })
+    except ConnectionError:
+        _exchange_status["bitunix"]["disabled"] = True
+        return jsonify({"error": "Bitunix geo-blocked"}), 403
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/bitunix/ticker/<symbol>", methods=["GET"])
+def bitunix_ticker_route(symbol):
+    """GET /bitunix/ticker/<symbol> — public market ticker."""
+    try:
+        t = bitunix_get_ticker(symbol.upper())
+        # Strip the raw payload for cleaner responses
+        t.pop("raw", None)
+        return jsonify(t)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/bitunix/positions", methods=["GET"])
+def bitunix_positions_route():
+    """GET /bitunix/positions — currently open Bitunix futures positions."""
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+    if _exchange_status["bitunix"]["disabled"]:
+        return jsonify({"error": _exchange_status["bitunix"]["error"], "disabled": True}), 403
+    try:
+        return jsonify(bitunix_get_positions())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/bitunix/orders/pending", methods=["GET"])
+def bitunix_orders_pending_route():
+    """GET /bitunix/orders/pending — open limit/stop orders on Bitunix."""
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+    if _exchange_status["bitunix"]["disabled"]:
+        return jsonify({"error": _exchange_status["bitunix"]["error"], "disabled": True}), 403
+    try:
+        return jsonify(bitunix_get_open_orders())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/bitunix/trade/execute", methods=["POST"])
+def bitunix_trade_execute():
+    """POST /bitunix/trade/execute — place a futures order on Bitunix.
+
+    Same risk engine as /api/trade/approve. Differs in that it also
+    sizes the position (qty = risk_amount / |entry-sl|) and calls Bitunix
+    directly. Returns trade_id + order_id.
+    """
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+
+    if _bitunix_emergency_stop:
+        return jsonify({"error": "Bitunix emergency stop active"}), 403
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+    if _exchange_status["bitunix"]["disabled"]:
+        return jsonify({"error": _exchange_status["bitunix"]["error"], "disabled": True}), 403
+
+    body = request.json or {}
+    required = ["symbol", "direction", "entry", "sl", "tp"]
+    for f in required:
+        if f not in body:
+            return jsonify({"error": f"Missing required field: {f}"}), 400
+
+    symbol     = body["symbol"].upper()
+    direction  = body["direction"].upper()
+    entry      = float(body["entry"])
+    sl         = float(body["sl"])
+    tp         = float(body["tp"])
+    risk_pct   = float(body.get("risk_percent", 1.0))
+    leverage   = int(body.get("leverage", BITUNIX_DEFAULT_LEVERAGE))
+    margin_mode = (body.get("margin_mode") or BITUNIX_MARGIN_MODE).upper()
+    order_type  = (body.get("order_type") or "MARKET").upper()
+    journal_id  = body.get("journal_trade_id", "")
+
+    # Build trade dict + run risk engine
+    trade = {
+        "id":               str(uuid.uuid4())[:12],
+        "symbol":           symbol,
+        "direction":        direction,
+        "entry":            entry,
+        "sl":               sl,
+        "tp":               tp,
+        "risk_percent":     risk_pct,
+        "be_trigger_rr":    float(body.get("be_trigger_rr", 1.5)),
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "source":           "journal",
+        "journal_trade_id": journal_id,
+        "venue":            "bitunix",
+        "leverage":         leverage,
+        "margin_mode":      margin_mode,
+        "confidence":       body.get("confidence", 0),
+        "dxy_confirms":     body.get("dxy_confirms", ""),
+        "entry_confirmation": body.get("entry_confirmation", ""),
+        "risk_limits":      body.get("risk_limits", {}),
+        "status":           "pending",
+        "paper":            PAPER_TRADING_MODE,
+    }
+    account_state = body.get("account_state") or _get_account_state_from_gist()
+    result = validate_trade(trade, account_state)
+
+    if not result["approved"]:
+        trade["status"] = "rejected"
+        trade["reject_reason"] = result["reason"]
+        _execution_queue.append(trade)
+        _log_execution_event(
+            trade_id=trade["id"], symbol=symbol, direction=direction,
+            planned_entry=entry, status="rejected",
+            paper=trade.get("paper", False), reason=result["reason"],
+        )
+        return jsonify({
+            "approved": False, "reason": result["reason"],
+            "warnings": result["warnings"], "trade_id": trade["id"],
+        }), 200
+
+    # Futures position sizing — qty in BASE units (BTC, ETH, …)
+    capital = float(account_state.get("capital", 0) or 0)
+    risk_amount = capital * (risk_pct / 100.0) if capital else 0
+    price_dist = abs(entry - sl)
+    if price_dist <= 0:
+        return jsonify({"error": "Invalid SL — zero distance from entry"}), 400
+    if risk_amount <= 0:
+        return jsonify({"error": "Cannot size position — capital not available in account state"}), 400
+
+    qty = round(risk_amount / price_dist, 4)
+    notional = qty * entry
+    required_margin = notional / max(leverage, 1)
+
+    trade["lot_size"]        = qty
+    trade["notional"]        = notional
+    trade["required_margin"] = required_margin
+    trade["warnings"]        = result["warnings"]
+    trade["status"]          = "approved"
+    _execution_queue.append(trade)
+
+    if PAPER_TRADING_MODE:
+        # Paper-trading: skip the live order, mark queue as paper_executed
+        trade["status"]      = "paper_executed"
+        trade["executed_at"] = datetime.now(timezone.utc).isoformat()
+        _log_execution_event(
+            trade_id=trade["id"], symbol=symbol, direction=direction,
+            planned_entry=entry, actual_entry=entry, status="paper_executed",
+            paper=True, reason="Bitunix paper mode",
+        )
+        msg = (
+            f"\U0001f4c4 <b>PAPER TRADE on Bitunix (demo)</b>\n\n"
+            f"<b>{symbol}</b> {direction}\n"
+            f"\U0001f4cd Entry: {entry} | SL: {sl} | TP: {tp}\n"
+            f"\U0001f4e6 Qty: {qty} (notional ${notional:.2f}, margin ${required_margin:.2f})\n"
+            f"Lev {leverage}x \u00b7 {margin_mode}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+        send_telegram(msg)
+        return jsonify({
+            "approved": True, "paper": True,
+            "trade_id": trade["id"], "order_id": None,
+            "qty": qty, "required_margin": required_margin,
+            "warnings": result["warnings"],
+        }), 200
+
+    # Live execution: ensure leverage + margin mode, then place order
+    side = "BUY" if direction == "BUY" else "SELL"
+    try:
+        bitunix_ensure_symbol_setup(symbol, leverage=leverage, margin_mode=margin_mode)
+    except Exception as e:
+        logging.warning("Bitunix setup pre-order failed: %s", e)
+
+    try:
+        place_resp = bitunix_place_order(
+            symbol=symbol, side=side, qty=qty,
+            order_type=order_type,
+            price=(entry if order_type == "LIMIT" else None),
+            client_id=(journal_id or trade["id"]),
+            tp_price=tp, sl_price=sl,
+        )
+    except ConnectionError:
+        _exchange_status["bitunix"]["disabled"] = True
+        return jsonify({"error": "Bitunix geo-blocked"}), 403
+    except Exception as e:
+        trade["status"] = "execution_failed"
+        trade["error"] = str(e)
+        _log_execution_event(
+            trade_id=trade["id"], symbol=symbol, direction=direction,
+            planned_entry=entry, status="execution_failed",
+            reason=str(e),
+        )
+        return jsonify({"approved": True, "error": str(e), "trade_id": trade["id"]}), 502
+
+    order_data = (place_resp or {}).get("data") or {}
+    order_id = str(order_data.get("orderId") or order_data.get("id") or "")
+    trade["status"]      = "executed"
+    trade["actual_entry"] = entry
+    trade["executed_at"] = datetime.now(timezone.utc).isoformat()
+    trade["bitunixOrderId"] = order_id
+
+    _log_execution_event(
+        trade_id=trade["id"], symbol=symbol, direction=direction,
+        planned_entry=entry, actual_entry=entry, status="executed",
+        reason="Bitunix order placed", mt4_ticket=order_id,
+    )
+
+    # Mirror executed status onto the journal row, if linked
+    if journal_id:
+        try:
+            trades_list = get_trades()
+            for t in trades_list:
+                if t.get("id") == journal_id:
+                    t["status"]          = "open"
+                    t["source"]          = "bitunix"
+                    t["platform"]        = "bitunix"
+                    t["bitunixOrderId"]  = order_id
+                    t["bitunixLeverage"] = leverage
+                    t["bitunixMargin"]   = margin_mode
+                    t["execStatus"]      = "executed"
+                    t["execActualEntry"] = entry
+                    t["execExecutedAt"]  = trade["executed_at"]
+                    t["updatedAt"]       = trade["executed_at"]
+                    break
+            save_trades(trades_list)
+        except Exception as e:
+            logging.error("Bitunix execute — journal patch failed: %s", e)
+
+    msg = (
+        f"\U0001f680 <b>Bitunix order placed!</b>\n\n"
+        f"<b>{symbol}</b> {direction} \u00b7 Lev {leverage}x \u00b7 {margin_mode}\n"
+        f"\U0001f4cd Entry: {entry} | SL: {sl} | TP: {tp}\n"
+        f"\U0001f4e6 Qty: {qty} (notional ${notional:.2f}, margin ${required_margin:.2f})\n"
+        f"Order: <code>{order_id}</code>\n\n"
+        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+    )
+    send_telegram(msg)
+    logging.info("Bitunix order placed: %s %s qty=%s order_id=%s", symbol, direction, qty, order_id)
+
+    return jsonify({
+        "approved": True, "paper": False,
+        "trade_id": trade["id"], "order_id": order_id,
+        "qty": qty, "notional": notional, "required_margin": required_margin,
+        "warnings": result["warnings"],
+    }), 201
+
+
+@app.route("/bitunix/trade/cancel", methods=["POST"])
+def bitunix_trade_cancel():
+    """POST /bitunix/trade/cancel — cancel a pending Bitunix order."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+
+    body = request.json or {}
+    symbol = (body.get("symbol") or "").upper()
+    order_id = body.get("order_id")
+    client_id = body.get("client_id") or body.get("journal_trade_id")
+    if not symbol or (not order_id and not client_id):
+        return jsonify({"error": "symbol and (order_id or client_id) required"}), 400
+    try:
+        resp = bitunix_cancel_order(symbol, order_id=order_id, client_id=client_id)
+        return jsonify({"ok": True, "result": resp.get("data")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/bitunix/emergency-stop", methods=["GET"])
+def bitunix_emergency_stop_get():
+    """GET /api/bitunix/emergency-stop — current Bitunix kill-switch state."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    return jsonify({
+        "venue":      "bitunix",
+        "emergency":  _bitunix_emergency_stop,
+        "active":     _bitunix_emergency_stop,
+        "message":    ("Bitunix execution paused — kill switch active"
+                        if _bitunix_emergency_stop else "All clear — Bitunix executions enabled"),
+    })
+
+
+@app.route("/api/bitunix/emergency-stop", methods=["POST"])
+def bitunix_emergency_stop_post():
+    """POST /api/bitunix/emergency-stop — set Bitunix kill switch."""
+    global _bitunix_emergency_stop
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    body = request.json or {}
+    activate = bool(body.get("emergency", False))
+    _bitunix_emergency_stop = activate
+    if activate:
+        send_telegram(
+            "\U0001f6a8 <b>Bitunix EMERGENCY STOP active!</b>\n\n"
+            "All new Bitunix executions blocked. "
+            "MT5 routing remains independent — flip its own kill switch separately if needed."
+        )
+        logging.warning("Bitunix kill switch ACTIVATED via API")
+    else:
+        send_telegram("\u2705 <b>Bitunix kill switch cleared</b> — executions resumed.")
+        logging.info("Bitunix kill switch deactivated via API")
+    return jsonify({"ok": True, "venue": "bitunix", "emergency": _bitunix_emergency_stop})
+
+
+@app.route("/api/bitunix/emergency-stop", methods=["DELETE"])
+def bitunix_emergency_stop_clear():
+    """DELETE /api/bitunix/emergency-stop — clear the Bitunix kill switch."""
+    global _bitunix_emergency_stop
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    _bitunix_emergency_stop = False
+    return jsonify({"ok": True, "venue": "bitunix", "emergency": False})
 
 
 # ═══════════════════════════════════════════════════════
