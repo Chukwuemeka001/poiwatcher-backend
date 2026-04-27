@@ -2193,6 +2193,26 @@ def bitunix_trade_close_monitor():
 
         exit_price = float(t.get("avgPrice", t.get("price", 0)) or 0)
         pnl        = float(t.get("realizedPNL", t.get("realizedPnl", 0)) or 0)
+        # Bitunix fills carry a trading fee (commission) and may carry a funding
+        # fee accrued while the position was open. Capture both as floats — the
+        # journal aggregates these for the crypto stats card.
+        try:
+            fee_amt = float(t.get("fee") or t.get("commission") or 0)
+        except (TypeError, ValueError):
+            fee_amt = 0.0
+        try:
+            funding_amt = float(t.get("fundingFee") or t.get("funding") or 0)
+        except (TypeError, ValueError):
+            funding_amt = 0.0
+        # Liquidation detection — Bitunix tags forced closes with orderSource
+        # "LIQUIDATION" / "ADL" or similar; we also fall back to checking the
+        # tradeType / orderType for "LIQ" markers.
+        order_source = (t.get("orderSource") or t.get("source") or "").upper()
+        order_type_raw = (t.get("orderType") or t.get("type") or "").upper()
+        is_liquidation = (
+            "LIQ" in order_source or order_source == "ADL"
+            or "LIQ" in order_type_raw or "LIQUIDAT" in order_type_raw
+        )
         ctime_ms   = t.get("ctime") or t.get("createTime") or t.get("time") or int(time.time() * 1000)
         try:
             close_iso = datetime.fromtimestamp(int(ctime_ms) / 1000, tz=timezone.utc).isoformat()
@@ -2226,9 +2246,12 @@ def bitunix_trade_close_monitor():
             if entry_price:
                 bitunix_slippage = round(((exit_price - entry_price) / entry_price) * 100.0, 4)
 
-            # close_reason inferred from exit price proximity to TP/SL
+            # close_reason inferred from exit price proximity to TP/SL,
+            # but a forced liquidation always wins.
             close_reason = "Manual"
-            if found.get("breakEvenSet") and abs(exit_price - entry_price) / max(entry_price, 1e-9) < 0.001:
+            if is_liquidation:
+                close_reason = "Liquidated"
+            elif found.get("breakEvenSet") and abs(exit_price - entry_price) / max(entry_price, 1e-9) < 0.001:
                 close_reason = "BE"
             elif tp_price and abs(exit_price - tp_price) / max(tp_price, 1e-9) < 0.0015:
                 close_reason = "TP Hit"
@@ -2256,12 +2279,25 @@ def bitunix_trade_close_monitor():
             found["dateClose"]       = close_iso
             found["actualRR"]        = actual_rr
             found["outcome"]         = outcome
-            found["exitType"]        = {"TP Hit":"tp","SL Hit":"sl","BE":"be","Manual":"manual"}.get(close_reason, "manual")
+            found["exitType"]        = {"TP Hit":"tp","SL Hit":"sl","BE":"be","Manual":"manual","Liquidated":"liquidation"}.get(close_reason, "manual")
             found["closeReason"]     = close_reason
             found["bitunixOrderId"]  = order_id
             found["bitunixAutoClose"]= True
             found["bitunixMatchTier"]= tier
             found["bitunixSlippage"] = bitunix_slippage
+            # Crypto-specific cost basis fields — frontend Phase 4 dashboard
+            # reads these for the Bitunix stats card. Sum onto any prior values
+            # so partial-close scenarios accumulate fees correctly.
+            try:
+                found["bitunixFee"] = round(float(found.get("bitunixFee") or 0) + fee_amt, 6)
+            except (TypeError, ValueError):
+                found["bitunixFee"] = fee_amt
+            try:
+                found["bitunixFundingFee"] = round(float(found.get("bitunixFundingFee") or 0) + funding_amt, 6)
+            except (TypeError, ValueError):
+                found["bitunixFundingFee"] = funding_amt
+            if is_liquidation:
+                found["liquidated"] = True
             found["duration"]        = duration_str
             found["reviewNeeded"]    = True
             found["source"]          = "bitunix_auto_close"
@@ -2285,10 +2321,16 @@ def bitunix_trade_close_monitor():
             row["bitunixMatchTier"] = "no_match"
             row["reviewNeeded"]     = True
             row["source"]           = "bitunix_auto_close"
+            row["bitunixFee"]       = fee_amt
+            row["bitunixFundingFee"]= funding_amt
+            if is_liquidation:
+                row["liquidated"]   = True
+                row["closeReason"]  = "Liquidated"
+                row["exitType"]     = "liquidation"
             trades_list.append(row)
             actual_rr = 0.0
-            duration_str = ""
-            close_reason = "Manual"
+            duration_str = "Liquidated" if is_liquidation else ""
+            close_reason = "Liquidated" if is_liquidation else "Manual"
 
         _logged_trade_ids.add(dedupe_key)
         new_count += 1
