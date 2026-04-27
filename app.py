@@ -1591,6 +1591,7 @@ def exchange_sync_loop():
                     _exchange_status["bitunix"]["error"]          = None
                     bitunix_trade_close_monitor()
                     bitunix_position_monitor()
+                    bitunix_limit_expiry_monitor()
                 except ConnectionError:
                     _exchange_status["bitunix"]["disabled"]  = True
                     _exchange_status["bitunix"]["connected"] = False
@@ -2017,12 +2018,21 @@ def bitunix_position_monitor():
             except Exception as e:
                 logging.warning("Bitunix BE journal patch failed: %s", e)
 
+            direction_label = "LONG" if side == "BUY" else "SHORT"
+            _log_execution_event(
+                trade_id=str(client_id or ""), symbol=symbol,
+                direction=direction_label,
+                planned_entry=entry, actual_entry=mark,
+                status="bitunix_be_set", venue="bitunix",
+                bitunix_order_id=str(pos_id or ""),
+                reason=f"BE set at 1:5 R:R (R={rr:.2f})",
+            )
             msg = (
                 f"\U0001f512 <b>Break even set on Bitunix!</b>\n\n"
-                f"<b>{symbol}</b> {side} reached 1:5 R:R\n"
-                f"\U0001f4cd Entry: {entry}\n"
-                f"\U0001f4ca Mark: {mark} (R = {rr:.2f})\n"
-                f"SL moved to entry — risk eliminated \u2705\n\n"
+                f"<b>{symbol}</b> {direction_label}\n"
+                f"Trade is now RISK FREE \u2705\n"
+                f"SL moved to entry: <b>{entry}</b>\n"
+                f"\U0001f4ca Mark: {mark} (R = {rr:.2f})\n\n"
                 f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
             )
             send_telegram(msg)
@@ -2121,6 +2131,40 @@ def bitunix_trade_close_monitor():
     new_count = 0
 
     for t in history:
+        # Detect "limit order filled" — opening fill (NOT reduceOnly) for an order
+        # we previously logged as bitunix_limit_placed. Emit a fill event before
+        # we drop the entry from _pending_limit_orders.
+        order_id_raw = str(t.get("orderId") or t.get("id") or "")
+        if order_id_raw:
+            for lo in _pending_limit_orders:
+                if (lo.get("venue") == "bitunix"
+                    and lo.get("status") == "limit_placed"
+                    and str(lo.get("order_ticket") or "") == order_id_raw):
+                    actual_fill = float(t.get("avgPrice", t.get("price", 0)) or 0) or lo.get("entry")
+                    planned = float(lo.get("entry") or 0)
+                    slip_pct = ((actual_fill - planned) / planned * 100.0) if planned else 0.0
+                    lo["status"] = "limit_order_filled"
+                    lo["filled_at"] = datetime.now(timezone.utc).isoformat()
+                    lo["actual_entry"] = actual_fill
+                    _log_execution_event(
+                        trade_id=str(lo.get("client_id") or lo.get("id") or ""),
+                        symbol=lo.get("symbol", ""),
+                        direction=(lo.get("direction") or "").upper(),
+                        planned_entry=planned, actual_entry=actual_fill,
+                        slippage=round(slip_pct, 4),
+                        status="bitunix_limit_filled", venue="bitunix",
+                        bitunix_order_id=order_id_raw,
+                        reason="Bitunix limit order filled",
+                    )
+                    send_telegram(
+                        f"\u2705 <b>Bitunix limit FILLED!</b>\n\n"
+                        f"<b>{lo.get('symbol','')}</b> {(lo.get('direction') or '').upper()}\n"
+                        f"Ordered: <b>{planned}</b> \u2192 Filled: <b>{actual_fill}</b>\n"
+                        f"Slippage: {slip_pct:+.3f}%\n\n"
+                        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+                    )
+                    break
+
         # Only consider closing fills (reduceOnly / tradeSide=CLOSE / position closed)
         trade_side = (t.get("tradeSide") or t.get("positionSide") or "").upper()
         reduce_only = bool(t.get("reduceOnly") or False)
@@ -2166,6 +2210,7 @@ def bitunix_trade_close_monitor():
             entry_price = float(found.get("entry") or 0)
             risk = float(found.get("risk") or 0)
             sl_price = float(found.get("sl") or 0)
+            tp_price = float(found.get("tp") or 0)
             r_dist = abs(entry_price - sl_price) if sl_price else 0
             actual_rr = (abs(exit_price - entry_price) / r_dist) if r_dist else 0
             if direction == "short":
@@ -2175,15 +2220,49 @@ def bitunix_trade_close_monitor():
 
             outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "be")
 
+            # Bitunix slippage = (actual_exit - planned_target) / entry
+            # — only meaningful if TP/SL hit exactly
+            bitunix_slippage = 0.0
+            if entry_price:
+                bitunix_slippage = round(((exit_price - entry_price) / entry_price) * 100.0, 4)
+
+            # close_reason inferred from exit price proximity to TP/SL
+            close_reason = "Manual"
+            if found.get("breakEvenSet") and abs(exit_price - entry_price) / max(entry_price, 1e-9) < 0.001:
+                close_reason = "BE"
+            elif tp_price and abs(exit_price - tp_price) / max(tp_price, 1e-9) < 0.0015:
+                close_reason = "TP Hit"
+            elif sl_price and abs(exit_price - sl_price) / max(sl_price, 1e-9) < 0.0015:
+                close_reason = "SL Hit"
+
+            # duration (ms → minutes string)
+            duration_str = ""
+            try:
+                open_dt = datetime.fromisoformat((found.get("dateOpen") or "").replace("Z", "+00:00"))
+                if open_dt.tzinfo is None:
+                    open_dt = open_dt.replace(tzinfo=timezone.utc)
+                close_dt = datetime.fromisoformat(close_iso.replace("Z", "+00:00"))
+                if close_dt.tzinfo is None:
+                    close_dt = close_dt.replace(tzinfo=timezone.utc)
+                mins = int((close_dt - open_dt).total_seconds() // 60)
+                hrs, m = divmod(mins, 60)
+                duration_str = f"{hrs}h {m}m" if hrs else f"{m}m"
+            except (ValueError, AttributeError):
+                duration_str = ""
+
             found["status"]          = "closed"
             found["exitPrice"]       = exit_price
             found["actualPnL"]       = pnl
             found["dateClose"]       = close_iso
             found["actualRR"]        = actual_rr
             found["outcome"]         = outcome
+            found["exitType"]        = {"TP Hit":"tp","SL Hit":"sl","BE":"be","Manual":"manual"}.get(close_reason, "manual")
+            found["closeReason"]     = close_reason
             found["bitunixOrderId"]  = order_id
             found["bitunixAutoClose"]= True
             found["bitunixMatchTier"]= tier
+            found["bitunixSlippage"] = bitunix_slippage
+            found["duration"]        = duration_str
             found["reviewNeeded"]    = True
             found["source"]          = "bitunix_auto_close"
             found["updatedAt"]       = datetime.now(timezone.utc).isoformat()
@@ -2205,23 +2284,39 @@ def bitunix_trade_close_monitor():
             row["bitunixAutoClose"] = True
             row["bitunixMatchTier"] = "no_match"
             row["reviewNeeded"]     = True
+            row["source"]           = "bitunix_auto_close"
             trades_list.append(row)
+            actual_rr = 0.0
+            duration_str = ""
+            close_reason = "Manual"
 
         _logged_trade_ids.add(dedupe_key)
         new_count += 1
 
         outcome_str = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
+        entry_for_msg = float((found or {}).get("entry") or 0) or exit_price
+        rr_str = ("+" if actual_rr >= 0 else "") + f"{actual_rr:.2f}R"
+        _log_execution_event(
+            trade_id=str((found or {}).get("id") or ""), symbol=symbol,
+            direction=(direction or "").upper(),
+            planned_entry=entry_for_msg, actual_entry=exit_price,
+            status="bitunix_closed", venue="bitunix",
+            bitunix_order_id=order_id,
+            reason=f"{outcome_str} \u00b7 {close_reason} \u00b7 P&L ${pnl:.2f}",
+        )
         msg = (
-            f"\U0001f4ca <b>Trade closed on Bitunix!</b>  [{outcome_str}]\n\n"
-            f"<b>{symbol}</b> {direction.upper() if direction else ''}\n"
-            f"\U0001f4cd Exit: <b>{exit_price}</b>\n"
-            f"\U0001f4b0 P&amp;L: <b>${pnl:.2f}</b>\n"
-            f"Match: <code>{tier or 'no_match'}</code>\n\n"
-            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Review in journal</a>"
+            f"\U0001f4ca <b>Bitunix trade CLOSED</b> \u2014 [{outcome_str}]\n\n"
+            f"<b>{symbol}</b> {(direction or '').upper()}\n"
+            f"Entry: <b>{entry_for_msg}</b> \u2192 Exit: <b>{exit_price}</b>\n"
+            f"P&amp;L: <b>${pnl:+.2f}</b>\n"
+            f"Actual R:R: <b>{rr_str}</b>\n"
+            f"Duration: {duration_str or '\u2014'}\n"
+            f"Close reason: {close_reason}\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal to add post-trade review</a>"
         )
         send_telegram(msg)
-        logging.info("Bitunix close logged: %s %s exit=%s pnl=%s match=%s",
-                     order_id, symbol, exit_price, pnl, tier or "no_match")
+        logging.info("Bitunix close logged: %s %s exit=%s pnl=%s match=%s reason=%s",
+                     order_id, symbol, exit_price, pnl, tier or "no_match", close_reason)
 
     if new_count > 0:
         try:
@@ -2229,6 +2324,52 @@ def bitunix_trade_close_monitor():
         except Exception as e:
             logging.error("Bitunix close monitor — Gist save failed: %s", e)
         logging.info("Auto-logged %d new Bitunix close(s)", new_count)
+
+
+def bitunix_limit_expiry_monitor():
+    """Mark pending Bitunix limit orders as expired after their 24h window.
+
+    Mirrors the MT5 limit-expiry behavior: emits `bitunix_limit_expired` to the
+    execution log and fires a Telegram so the user knows the order is stale.
+    The actual cancel is the user's responsibility (or Bitunix server-side if
+    they configured GTC). We never auto-cancel here to avoid surprising flips.
+    """
+    if _exchange_status["bitunix"]["disabled"] or not BITUNIX_API_KEY:
+        return
+    now = datetime.now(timezone.utc)
+    for lo in _pending_limit_orders:
+        if lo.get("venue") != "bitunix" or lo.get("status") != "limit_placed":
+            continue
+        try:
+            exp = datetime.fromisoformat(str(lo.get("expires_at", "")).replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            continue
+        if now < exp:
+            continue
+        lo["status"] = "limit_order_expired"
+        lo["expired_at"] = now.isoformat()
+        order_id = str(lo.get("order_ticket") or "")
+        _log_execution_event(
+            trade_id=str(lo.get("client_id") or lo.get("id") or ""),
+            symbol=lo.get("symbol", ""),
+            direction=(lo.get("direction") or "").upper(),
+            planned_entry=lo.get("entry"),
+            status="bitunix_limit_expired", venue="bitunix",
+            bitunix_order_id=order_id,
+            reason="Bitunix limit order 24h window elapsed without fill",
+        )
+        send_telegram(
+            f"\u23f0 <b>Bitunix limit order EXPIRED</b>\n\n"
+            f"<b>{lo.get('symbol','')}</b> {(lo.get('direction') or '').upper()}\n"
+            f"Was waiting at: <b>{lo.get('entry')}</b>\n"
+            f"24h window elapsed without fill.\n"
+            f"Order: <code>{order_id}</code>\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+        logging.info("Bitunix limit expired: %s %s order=%s",
+                     lo.get("symbol"), lo.get("direction"), order_id)
 
 
 # ── Bitunix Flask Routes ───────────────────────────────
@@ -2374,13 +2515,21 @@ def bitunix_trade_execute():
         _execution_queue.append(trade)
         _log_execution_event(
             trade_id=trade["id"], symbol=symbol, direction=direction,
-            planned_entry=entry, status="rejected",
+            planned_entry=entry, status="bitunix_rejected", venue="bitunix",
             paper=trade.get("paper", False), reason=result["reason"],
         )
         return jsonify({
             "approved": False, "reason": result["reason"],
             "warnings": result["warnings"], "trade_id": trade["id"],
         }), 200
+
+    # Risk engine OK — log approval as a separate event so the journal can
+    # show the approval moment even if execution fails downstream
+    _log_execution_event(
+        trade_id=trade["id"], symbol=symbol, direction=direction,
+        planned_entry=entry, status="bitunix_approved", venue="bitunix",
+        paper=PAPER_TRADING_MODE, reason="Risk engine approved Bitunix order",
+    )
 
     # Futures position sizing — qty in BASE units (BTC, ETH, …)
     capital = float(account_state.get("capital", 0) or 0)
@@ -2408,15 +2557,16 @@ def bitunix_trade_execute():
         trade["executed_at"] = datetime.now(timezone.utc).isoformat()
         _log_execution_event(
             trade_id=trade["id"], symbol=symbol, direction=direction,
-            planned_entry=entry, actual_entry=entry, status="paper_executed",
+            planned_entry=entry, actual_entry=entry,
+            status="bitunix_executed", venue="bitunix",
             paper=True, reason="Bitunix paper mode",
         )
         msg = (
-            f"\U0001f4c4 <b>PAPER TRADE on Bitunix (demo)</b>\n\n"
-            f"<b>{symbol}</b> {direction}\n"
-            f"\U0001f4cd Entry: {entry} | SL: {sl} | TP: {tp}\n"
-            f"\U0001f4e6 Qty: {qty} (notional ${notional:.2f}, margin ${required_margin:.2f})\n"
-            f"Lev {leverage}x \u00b7 {margin_mode}\n\n"
+            f"\U0001f7e7 <b>Bitunix trade EXECUTED!</b>  (paper)\n\n"
+            f"<b>{symbol}</b> {direction} @ <b>{entry}</b>\n"
+            f"Position: <b>{qty}</b> \u00b7 Leverage: <b>{leverage}x</b>\n"
+            f"SL: {sl} | TP: {tp}\n"
+            f"Margin: <b>${required_margin:.2f}</b>\n\n"
             f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
         )
         send_telegram(msg)
@@ -2450,37 +2600,66 @@ def bitunix_trade_execute():
         trade["error"] = str(e)
         _log_execution_event(
             trade_id=trade["id"], symbol=symbol, direction=direction,
-            planned_entry=entry, status="execution_failed",
+            planned_entry=entry, status="bitunix_execution_failed", venue="bitunix",
             reason=str(e),
         )
         return jsonify({"approved": True, "error": str(e), "trade_id": trade["id"]}), 502
 
     order_data = (place_resp or {}).get("data") or {}
     order_id = str(order_data.get("orderId") or order_data.get("id") or "")
-    trade["status"]      = "executed"
+    is_limit = (order_type == "LIMIT")
+    trade["status"]      = "limit_placed" if is_limit else "executed"
     trade["actual_entry"] = entry
     trade["executed_at"] = datetime.now(timezone.utc).isoformat()
     trade["bitunixOrderId"] = order_id
 
-    _log_execution_event(
-        trade_id=trade["id"], symbol=symbol, direction=direction,
-        planned_entry=entry, actual_entry=entry, status="executed",
-        reason="Bitunix order placed", mt4_ticket=order_id,
-    )
+    if is_limit:
+        # Track the pending limit so the close monitor can later flag it as
+        # `bitunix_limit_filled` once a fill comes through
+        _pending_limit_orders.append({
+            "id":          trade["id"],
+            "venue":       "bitunix",
+            "symbol":      symbol,
+            "direction":   direction,
+            "entry":       entry, "sl": sl, "tp": tp,
+            "qty":         qty,
+            "leverage":    leverage,
+            "margin_mode": margin_mode,
+            "order_ticket": order_id,
+            "client_id":   journal_id or trade["id"],
+            "placed_at":   datetime.now(timezone.utc).isoformat(),
+            "expires_at":  (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+            "status":      "limit_placed",
+            "paper":       False,
+        })
+        _log_execution_event(
+            trade_id=trade["id"], symbol=symbol, direction=direction,
+            planned_entry=entry, status="bitunix_limit_placed",
+            venue="bitunix", bitunix_order_id=order_id,
+            reason="Bitunix limit order placed",
+        )
+    else:
+        _log_execution_event(
+            trade_id=trade["id"], symbol=symbol, direction=direction,
+            planned_entry=entry, actual_entry=entry,
+            status="bitunix_executed", venue="bitunix",
+            bitunix_order_id=order_id,
+            reason="Bitunix order placed",
+        )
 
-    # Mirror executed status onto the journal row, if linked
+    # Mirror executed/limit-placed status onto the journal row, if linked
     if journal_id:
         try:
             trades_list = get_trades()
             for t in trades_list:
                 if t.get("id") == journal_id:
-                    t["status"]          = "open"
+                    t["status"]          = "limit_placed" if is_limit else "open"
                     t["source"]          = "bitunix"
                     t["platform"]        = "bitunix"
                     t["bitunixOrderId"]  = order_id
                     t["bitunixLeverage"] = leverage
                     t["bitunixMargin"]   = margin_mode
-                    t["execStatus"]      = "executed"
+                    t["execStatus"]      = "limit_placed" if is_limit else "executed"
                     t["execActualEntry"] = entry
                     t["execExecutedAt"]  = trade["executed_at"]
                     t["updatedAt"]       = trade["executed_at"]
@@ -2489,16 +2668,30 @@ def bitunix_trade_execute():
         except Exception as e:
             logging.error("Bitunix execute — journal patch failed: %s", e)
 
-    msg = (
-        f"\U0001f680 <b>Bitunix order placed!</b>\n\n"
-        f"<b>{symbol}</b> {direction} \u00b7 Lev {leverage}x \u00b7 {margin_mode}\n"
-        f"\U0001f4cd Entry: {entry} | SL: {sl} | TP: {tp}\n"
-        f"\U0001f4e6 Qty: {qty} (notional ${notional:.2f}, margin ${required_margin:.2f})\n"
-        f"Order: <code>{order_id}</code>\n\n"
-        f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
-    )
+    if is_limit:
+        msg = (
+            f"\u23f3 <b>Bitunix limit order placed</b>\n\n"
+            f"<b>{symbol}</b> {direction}\n"
+            f"Waiting at: <b>{entry}</b>\n"
+            f"Qty: {qty} \u00b7 Lev {leverage}x \u00b7 {margin_mode}\n"
+            f"SL: {sl} | TP: {tp}\n"
+            f"Expires: 24h\n"
+            f"Order: <code>{order_id}</code>\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
+    else:
+        msg = (
+            f"\U0001f7e7 <b>Bitunix trade EXECUTED!</b>\n\n"
+            f"<b>{symbol}</b> {direction} @ <b>{entry}</b>\n"
+            f"Position: <b>{qty}</b> \u00b7 Leverage: <b>{leverage}x</b>\n"
+            f"SL: {sl} | TP: {tp}\n"
+            f"Margin: <b>${required_margin:.2f}</b>\n"
+            f"Order: <code>{order_id}</code>\n\n"
+            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+        )
     send_telegram(msg)
-    logging.info("Bitunix order placed: %s %s qty=%s order_id=%s", symbol, direction, qty, order_id)
+    logging.info("Bitunix %s placed: %s %s qty=%s order_id=%s",
+                 "limit" if is_limit else "market", symbol, direction, qty, order_id)
 
     return jsonify({
         "approved": True, "paper": False,
@@ -2525,6 +2718,22 @@ def bitunix_trade_cancel():
         return jsonify({"error": "symbol and (order_id or client_id) required"}), 400
     try:
         resp = bitunix_cancel_order(symbol, order_id=order_id, client_id=client_id)
+        # Drop matching entry from pending-limits + log a cancellation event
+        for lo in list(_pending_limit_orders):
+            if (lo.get("venue") == "bitunix"
+                and (str(lo.get("order_ticket") or "") == str(order_id or "")
+                     or str(lo.get("client_id") or "") == str(client_id or "")
+                     or str(lo.get("id") or "") == str(client_id or ""))):
+                lo["status"] = "limit_order_cancelled"
+                lo["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+                break
+        _log_execution_event(
+            trade_id=str(client_id or ""), symbol=symbol,
+            direction=(body.get("direction") or "").upper(),
+            status="bitunix_cancelled", venue="bitunix",
+            bitunix_order_id=str(order_id or ""),
+            reason="Bitunix order cancelled by user",
+        )
         return jsonify({"ok": True, "result": resp.get("data")})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2610,6 +2819,20 @@ _mt4_emergency_stop = False
 
 def _log_execution_event(**kwargs):
     """Append an event to the execution log (most-recent first cap at MAX)."""
+    status = kwargs.get("status", "") or ""
+    # Auto-infer venue from event status if caller didn't specify one
+    venue = kwargs.get("venue")
+    if not venue:
+        if status.startswith("bitunix"):
+            venue = "bitunix"
+        elif status in ("limit_order_placed", "limit_order_filled",
+                        "limit_order_expired", "limit_order_cancelled"):
+            venue = "mt5"
+        elif status in ("executed", "paper_executed", "rejected",
+                        "execution_failed", "test_passed", "test_failed"):
+            venue = "mt5"
+        else:
+            venue = ""
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "trade_id": kwargs.get("trade_id", ""),
@@ -2618,9 +2841,11 @@ def _log_execution_event(**kwargs):
         "planned_entry": kwargs.get("planned_entry"),
         "actual_entry": kwargs.get("actual_entry"),
         "slippage": kwargs.get("slippage"),
-        "status": kwargs.get("status", ""),
+        "status": status,
         "reason": kwargs.get("reason", ""),
         "mt4_ticket": kwargs.get("mt4_ticket"),
+        "bitunix_order_id": kwargs.get("bitunix_order_id"),
+        "venue": venue,
         "paper": bool(kwargs.get("paper", False)),
         "test": bool(kwargs.get("test", False)),
     }
@@ -3320,18 +3545,41 @@ def execution_log():
     if status_filter and status_filter != "all":
         if status_filter == "success":
             entries = [e for e in entries if e["status"] in (
-                "executed", "paper_executed", "test_passed", "limit_order_filled")]
+                "executed", "paper_executed", "test_passed", "limit_order_filled",
+                "bitunix_executed", "bitunix_limit_filled")]
         elif status_filter == "failed":
             entries = [e for e in entries if e["status"] in (
-                "execution_failed", "test_failed", "rejected")]
+                "execution_failed", "test_failed", "rejected",
+                "bitunix_execution_failed", "bitunix_rejected")]
         elif status_filter == "paper":
             entries = [e for e in entries if e.get("paper")]
         elif status_filter == "limit":
             entries = [e for e in entries if e["status"] in (
                 "limit_order_placed", "limit_order_filled",
-                "limit_order_expired", "limit_order_cancelled")]
+                "limit_order_expired", "limit_order_cancelled",
+                "bitunix_limit_placed", "bitunix_limit_filled",
+                "bitunix_limit_expired")]
+        elif status_filter == "bitunix":
+            entries = [e for e in entries if e.get("venue") == "bitunix"
+                       or (e.get("status") or "").startswith("bitunix")]
+        elif status_filter == "mt5":
+            entries = [e for e in entries
+                       if e.get("venue") == "mt5"
+                       or (not (e.get("status") or "").startswith("bitunix")
+                           and not e.get("venue"))]
         else:
             entries = [e for e in entries if e["status"] == status_filter]
+
+    venue_filter = (request.args.get("venue") or "").strip().lower()
+    if venue_filter and venue_filter != "all":
+        if venue_filter == "bitunix":
+            entries = [e for e in entries if e.get("venue") == "bitunix"
+                       or (e.get("status") or "").startswith("bitunix")]
+        elif venue_filter == "mt5":
+            entries = [e for e in entries
+                       if e.get("venue") == "mt5"
+                       or (not (e.get("status") or "").startswith("bitunix")
+                           and not e.get("venue"))]
 
     return jsonify({
         "log": entries[:limit],
