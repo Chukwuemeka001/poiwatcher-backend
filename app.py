@@ -30,6 +30,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://chukwuemeka001.github.io")
 CORS(app, origins=[ALLOWED_ORIGIN])
 
+# ── Chart data integration (Finnhub forex + Binance crypto via CCXT) ──
+from chart_routes import chart_bp
+app.register_blueprint(chart_bp)
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GITHUB_GIST_TOKEN = os.environ.get("GITHUB_GIST_TOKEN", "")
