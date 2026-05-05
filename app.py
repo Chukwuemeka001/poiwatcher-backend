@@ -1678,18 +1678,18 @@ def _bitunix_rate_limit():
 def _bitunix_query_string(params):
     """Build the Bitunix-canonical queryParams string for signing.
 
-    Per Bitunix docs: keys sorted ASCII, concatenated as key1value1key2value2
-    with NO '=' or '&' separators. Empty params = empty string.
+    Per Bitunix spec: the urlencoded ``key=value&key=value`` form (NO leading
+    ``?``), keys sorted alphabetically. This MUST match the query string sent
+    on the wire byte-for-byte — otherwise the double-SHA256 signature fails.
+
+    Empty params → empty string.
     """
     if not params:
         return ""
-    parts = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if v is None:
-            continue
-        parts.append(f"{k}{v}")
-    return "".join(parts)
+    filtered = {k: v for k, v in params.items() if v is not None}
+    if not filtered:
+        return ""
+    return urlencode(sorted(filtered.items()))
 
 
 def _bitunix_sign(nonce, timestamp, query_string, body_string):
@@ -1740,10 +1740,13 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
             "timestamp": timestamp,
         })
 
-    # Build URL — use standard urlencoded query for the wire request
+    # Build URL — wire query MUST equal the signed query_string byte-for-byte
     url = BITUNIX_BASE_URL + path
-    if params:
-        url = url + "?" + urlencode({k: v for k, v in params.items() if v is not None})
+    if query_string:
+        url = url + "?" + query_string
+
+    # Mask api-key in any log output — first 8 chars only
+    key_prefix = (BITUNIX_API_KEY or "")[:8]
 
     try:
         if method == "GET":
@@ -1751,20 +1754,30 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
         else:
             r = requests.request(method, url, headers=headers, data=body_string.encode("utf-8"), timeout=15)
     except requests.RequestException as e:
+        logging.warning("Bitunix request failed [key=%s…] %s %s: %s", key_prefix, method, path, e)
         raise RuntimeError(f"Bitunix request failed: {e}") from e
 
     if r.status_code in (451, 403):
+        logging.warning("Bitunix geo-blocked/forbidden [key=%s…] %s %s status=%s body=%s",
+                        key_prefix, method, path, r.status_code, (r.text or "")[:500])
         raise ConnectionError("Bitunix geo-blocked or forbidden")
-    r.raise_for_status()
+    if not r.ok:
+        logging.warning("Bitunix HTTP %s [key=%s…] %s %s body=%s",
+                        r.status_code, key_prefix, method, path, (r.text or "")[:500])
+        r.raise_for_status()
 
     try:
         data = r.json()
     except ValueError as e:
+        logging.warning("Bitunix non-JSON response [key=%s…] %s %s body=%s",
+                        key_prefix, method, path, (r.text or "")[:500])
         raise RuntimeError(f"Bitunix returned non-JSON: {r.text[:200]}") from e
 
     code = data.get("code")
     if code != 0:
         msg = data.get("msg") or data.get("message") or "Unknown error"
+        logging.warning("Bitunix API error [key=%s…] %s %s code=%s msg=%s",
+                        key_prefix, method, path, code, msg)
         # Auth-style errors → propagate so caller can disable integration
         if code in (10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008,
                     10009, 10010, 10011, 10012):
@@ -2424,6 +2437,87 @@ def bitunix_limit_expiry_monitor():
 def bitunix_exchange_status():
     """GET /bitunix/exchange/status — connection state for Bitunix only."""
     return jsonify(_exchange_status.get("bitunix", {}))
+
+
+@app.route("/bitunix/debug-auth", methods=["GET"])
+def bitunix_debug_auth():
+    """GET /bitunix/debug-auth — single-shot signing diagnostic.
+
+    Bypasses ``_bitunix_request`` so a failure here can never disable the
+    venue circuit-breaker. Returns the exact pieces fed to the signer plus
+    the raw Bitunix response. Full key + secret are never echoed — only the
+    first 8 chars of the api-key as ``api_key_prefix``.
+
+    Protected by ``X-Execution-Key`` so the diagnostic info isn't world-readable.
+    """
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    if not BITUNIX_API_KEY or not BITUNIX_API_SECRET:
+        return jsonify({"ok": False, "error": "BITUNIX_API_KEY / BITUNIX_API_SECRET not set on the server"}), 400
+
+    # 1) Outbound IP — best-effort
+    try:
+        outbound_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+    except Exception as e:
+        outbound_ip = f"<lookup failed: {e}>"
+
+    # 2) Build the signed inputs exactly as a real GET /api/v1/futures/account
+    nonce = uuid.uuid4().hex
+    timestamp = str(int(time.time() * 1000))
+    params = {"marginCoin": "USDT"}
+    query_string = _bitunix_query_string(params)
+    body_string = ""
+
+    digest_input = f"{nonce}{timestamp}{BITUNIX_API_KEY}{query_string}{body_string}"
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+    sign_input = f"{digest}{BITUNIX_API_SECRET}"
+    sign = hashlib.sha256(sign_input.encode("utf-8")).hexdigest()
+
+    # 3) Make the live call directly with requests — NOT through _bitunix_request
+    url = BITUNIX_BASE_URL + "/api/v1/futures/account"
+    if query_string:
+        url = url + "?" + query_string
+    headers = {
+        "api-key":      BITUNIX_API_KEY,
+        "sign":         sign,
+        "nonce":        nonce,
+        "timestamp":    timestamp,
+        "language":     "en-US",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        status_code = r.status_code
+        try:
+            response_body = r.json()
+        except ValueError:
+            response_body = (r.text or "")[:1000]
+    except requests.RequestException as e:
+        status_code = None
+        response_body = f"<request failed: {e}>"
+
+    # 4) Redacted reply — full key + secret are NEVER returned. The previews
+    # are lengths-of-input prefixes so the user can eyeball whether the
+    # concatenation looks sane (right key prefix, right ms-precision ts, etc.)
+    redacted_digest_preview = digest_input[:60] + ("…" if len(digest_input) > 60 else "")
+    # sign_input contains the full secret at its tail — show only the digest portion
+    redacted_sign_preview = digest[:60] + "+<secret>"
+
+    return jsonify({
+        "ok":                       status_code == 200 and isinstance(response_body, dict) and response_body.get("code") == 0,
+        "outbound_ip":              outbound_ip,
+        "timestamp_used":           timestamp,
+        "nonce_used":               nonce,
+        "query_string":             query_string,
+        "digest_input_preview":     redacted_digest_preview,
+        "sign_input_preview":       redacted_sign_preview,
+        "bitunix_response_status":  status_code,
+        "bitunix_response_body":    response_body,
+        "api_key_prefix":           BITUNIX_API_KEY[:8],
+        "api_key_length":           len(BITUNIX_API_KEY),
+        "api_secret_length":        len(BITUNIX_API_SECRET),
+    })
 
 
 @app.route("/bitunix/account", methods=["GET"])
@@ -4095,6 +4189,13 @@ def _get_gist_data():
 
 def _start_background_threads():
     """Start all background threads."""
+    # Log outbound IP once on startup so the user can whitelist it in
+    # Bitunix's API key restriction list. Best-effort — never blocks startup.
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        logging.warning("Bitunix: outbound IP = %s — whitelist this in your Bitunix API key restriction list", ip)
+    except Exception as e:
+        logging.warning("Bitunix: could not determine outbound IP: %s", e)
     threading.Thread(target=price_monitor_loop, daemon=True).start()
     if BINANCE_API_KEY:
         threading.Thread(target=exchange_sync_loop, daemon=True).start()
