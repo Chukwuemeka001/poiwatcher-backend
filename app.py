@@ -1678,10 +1678,11 @@ def _bitunix_rate_limit():
 def _bitunix_query_string(params):
     """Build the Bitunix-canonical queryParams string for signing.
 
-    Per Bitunix spec: the urlencoded ``key=value&key=value`` form (NO leading
-    ``?``), keys sorted alphabetically. This MUST match the query string sent
-    on the wire byte-for-byte — otherwise the double-SHA256 signature fails.
+    Per Bitunix spec: concatenate key+value pairs sorted by key in
+    ascending ASCII order, NO equals signs, NO ampersands, NO spaces.
+    Example: {"marginCoin":"USDT","id":1} → "id1marginCoinUSDT"
 
+    The wire URL still uses standard urlencode — only signing uses this.
     Empty params → empty string.
     """
     if not params:
@@ -1689,7 +1690,7 @@ def _bitunix_query_string(params):
     filtered = {k: v for k, v in params.items() if v is not None}
     if not filtered:
         return ""
-    return urlencode(sorted(filtered.items()))
+    return "".join(f"{k}{v}" for k, v in sorted(filtered.items()))
 
 
 def _bitunix_sign(nonce, timestamp, query_string, body_string):
