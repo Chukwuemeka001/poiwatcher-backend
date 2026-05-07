@@ -4,3 +4,4 @@ requests==2.32.3
 anthropic==0.52.0
 gunicorn==23.0.0
 ccxt==4.4.50
+yfinance==0.2.56

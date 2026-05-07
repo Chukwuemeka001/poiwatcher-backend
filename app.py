@@ -177,15 +177,36 @@ def gist_read():
         return None
 
 
+_last_gist_error = None  # set by gist_write on failure for diagnostic surfaces
+
 def gist_write(data):
-    """Write updated data back to Gist."""
+    """Write updated data back to Gist.
+
+    Returns True on success, False on failure. The actual error is captured
+    in module-level ``_last_gist_error`` so the /alerts route (and the new
+    /debug/gist diagnostic) can surface it without changing this function's
+    bool return contract.
+    """
+    global _last_gist_error
+    if not GITHUB_GIST_TOKEN:
+        _last_gist_error = "GITHUB_GIST_TOKEN not set on Render env vars"
+        logging.error("Gist write skipped: %s", _last_gist_error)
+        return False
+    if not GIST_ID:
+        _last_gist_error = "GIST_ID not set on Render env vars"
+        return False
     try:
         payload = {"files": {GIST_FILE: {"content": json.dumps(data, indent=2)}}}
         r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), json=payload, timeout=15)
-        r.raise_for_status()
+        if not r.ok:
+            _last_gist_error = f"HTTP {r.status_code}: {(r.text or '')[:200]}"
+            logging.error("Gist write failed: %s", _last_gist_error)
+            return False
+        _last_gist_error = None
         return True
     except Exception as e:
-        logging.error("Gist write failed: %s", e)
+        _last_gist_error = f"{type(e).__name__}: {e}"
+        logging.error("Gist write failed: %s", _last_gist_error)
         return False
 
 
@@ -402,13 +423,51 @@ def _test_trade_levels(symbol, direction="BUY"):
 
 
 def get_klines(symbol="BTCUSDT", interval="1d", limit=200):
-    """Get OHLCV candle data via CoinGecko (only kline source post-Kraken removal)."""
-    if _is_cooled_down("CoinGecko"):
+    """Get OHLCV candle data — delegates to chart_data.get_candles which
+    routes crypto to Kraken+CoinGecko and forex to yfinance.
+
+    Returns the list-of-dicts shape ``{time:ISO, open, high, low, close, volume}``
+    expected by the AI prompt. chart_data emits unix timestamps; we convert
+    to ISO here so the prompt format stays byte-identical.
+    """
+    try:
+        from chart_data import get_candles as _chart_candles
+    except Exception as e:
+        logging.error("chart_data import failed: %s", e)
+        # Fall back to the legacy CoinGecko-only path so crypto still works
         try:
             return _klines_coingecko(symbol, interval, limit)
-        except Exception as e:
-            logging.warning("CoinGecko klines failed: %s", e)
-    raise RuntimeError(f"All kline sources failed for {symbol}")
+        except Exception as e2:
+            raise RuntimeError(f"All kline sources failed for {symbol}: {e2}")
+
+    try:
+        raw = _chart_candles(symbol, interval, limit)
+    except Exception as e:
+        # Crypto fallback: try CoinGecko directly (chart_data already tried)
+        if symbol.upper().endswith(("USDT", "USDC")):
+            try:
+                return _klines_coingecko(symbol, interval, limit)
+            except Exception:
+                pass
+        raise RuntimeError(f"All kline sources failed for {symbol}: {e}")
+
+    # Convert {time: unix_int} → {time: ISO string} to match the legacy prompt
+    out = []
+    for c in raw:
+        ts = c.get("time")
+        try:
+            iso = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat() if ts else None
+        except (ValueError, TypeError):
+            iso = str(ts)
+        out.append({
+            "time":   iso,
+            "open":   float(c.get("open", 0) or 0),
+            "high":   float(c.get("high", 0) or 0),
+            "low":    float(c.get("low", 0) or 0),
+            "close":  float(c.get("close", 0) or 0),
+            "volume": float(c.get("volume", 0) or 0),
+        })
+    return out
 
 
 def _klines_coingecko(symbol, interval, limit):
@@ -565,6 +624,57 @@ def health():
     return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
 
 
+@app.route("/debug/gist", methods=["GET"])
+def debug_gist():
+    """GET /debug/gist — public diagnostic for gist read/write health.
+
+    Probes a read first, then a no-op write (re-PATCHing the same content).
+    Token + gist id are never echoed; only the first 4 chars of the token
+    appear in `token_prefix` so the user can verify a token IS set.
+    """
+    out = {
+        "gist_id":         GIST_ID,
+        "gist_file":       GIST_FILE,
+        "token_set":       bool(GITHUB_GIST_TOKEN),
+        "token_prefix":    (GITHUB_GIST_TOKEN[:4] + "…") if GITHUB_GIST_TOKEN else None,
+        "last_known_error": _last_gist_error,
+    }
+    # Step 1 — read
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=10)
+        out["read_status"] = r.status_code
+        if r.ok:
+            j = r.json()
+            files = list((j.get("files") or {}).keys())
+            out["read_files"] = files
+            out["read_ok"] = GIST_FILE in files
+            if not out["read_ok"]:
+                out["read_hint"] = f"GIST_FILE '{GIST_FILE}' not in this gist; available: {files}"
+        else:
+            out["read_ok"] = False
+            out["read_body"] = (r.text or "")[:300]
+    except Exception as e:
+        out["read_ok"] = False
+        out["read_error"] = f"{type(e).__name__}: {e}"
+
+    # Step 2 — no-op write: re-PATCH whatever we just read so the gist content
+    # is byte-identical. If this fails, the token can read but not write.
+    try:
+        existing = gist_read()
+        if existing is not None:
+            ok = gist_write(existing)
+            out["write_ok"] = ok
+            if not ok:
+                out["write_error"] = _last_gist_error
+        else:
+            out["write_ok"] = False
+            out["write_error"] = "gist_read returned None — cannot test write"
+    except Exception as e:
+        out["write_ok"] = False
+        out["write_error"] = f"{type(e).__name__}: {e}"
+    return jsonify(out)
+
+
 @app.route("/alerts", methods=["GET"])
 def list_alerts():
     alerts = get_alerts()
@@ -603,7 +713,7 @@ def create_alert():
     alerts.append(alert)
     if save_alerts(alerts):
         return jsonify(alert), 201
-    return jsonify({"error": "Failed to save to Gist"}), 500
+    return jsonify({"error": "Failed to save to Gist", "detail": _last_gist_error}), 500
 
 
 @app.route("/alerts/<alert_id>", methods=["PUT"])
@@ -637,7 +747,7 @@ def update_alert(alert_id):
 
     if save_alerts(alerts):
         return jsonify(found)
-    return jsonify({"error": "Failed to save to Gist"}), 500
+    return jsonify({"error": "Failed to save to Gist", "detail": _last_gist_error}), 500
 
 
 @app.route("/alerts/<alert_id>", methods=["DELETE"])
@@ -648,7 +758,7 @@ def delete_alert(alert_id):
         return jsonify({"error": "Alert not found"}), 404
     if save_alerts(new_alerts):
         return jsonify({"ok": True})
-    return jsonify({"error": "Failed to save to Gist"}), 500
+    return jsonify({"error": "Failed to save to Gist", "detail": _last_gist_error}), 500
 
 
 @app.route("/price/<symbol>", methods=["GET"])
