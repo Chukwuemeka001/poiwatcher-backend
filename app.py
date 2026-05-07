@@ -281,20 +281,40 @@ def _price_coingecko(symbol):
 
 
 def get_price(symbol="BTCUSDT"):
-    """Get price: check cache first, then Bitunix → CoinGecko → CoinCap with cooldowns.
+    """Get price: check cache first, then Bitunix → CoinGecko → CoinCap (crypto)
+    or yfinance (forex) with cooldowns.
 
-    Bitunix is the PRIMARY source because we trade against its order book; using
-    its own ticker minimises any cross-venue spread when the journal app shows
-    a live price. Falls back through CoinGecko, then CoinCap as last resort.
+    Bitunix is the PRIMARY source for crypto because we trade against its order
+    book; that minimises cross-venue spread when the journal shows a live price.
+    Forex pairs (anything not ending in USDT/USDC) route through chart_data's
+    yfinance path so EURUSD, GBPUSD, etc work without API keys.
     """
     now = time.time()
+    sym_u = (symbol or "").upper()
 
     # 1. Return cached price if still fresh
-    cached = _price_cache.get(symbol)
+    cached = _price_cache.get(sym_u)
     if cached and (now - cached["time"]) < CACHE_TTL:
         return cached["price"]
 
-    # 2. Try sources in order, skipping any on cooldown
+    # 1b. Forex pairs delegate straight to chart_data (yfinance under the hood).
+    # The crypto chain below would always fail for them — _get_symbol_ids has no
+    # mapping and CoinCap/CoinGecko don't serve forex.
+    if not (sym_u.endswith("USDT") or sym_u.endswith("USDC")):
+        try:
+            from chart_data import get_price as _chart_price
+            price = float(_chart_price(sym_u))
+            logging.info("Price from chart_data (forex): %s = %s", sym_u, price)
+            _price_cache[sym_u] = {"price": price, "time": now}
+            return price
+        except Exception as e:
+            logging.warning("Forex price fetch failed for %s: %s", sym_u, e)
+            if cached:
+                logging.warning("Returning stale cache for %s", sym_u)
+                return cached["price"]
+            raise RuntimeError(f"All price sources failed for {sym_u}: {e}")
+
+    # 2. Crypto: Bitunix → CoinGecko → CoinCap with cooldowns
     sources = [
         ("Bitunix",   _price_bitunix),
         ("CoinGecko", _price_coingecko),
