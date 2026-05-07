@@ -1340,8 +1340,19 @@ _exchange_status = {
                 "balance_usdt": 0, "balance_btc": 0, "open_positions": 0},
     "bitunix": {"connected": False, "last_sync": None, "error": None, "disabled": False,
                 "balance_usdt": 0, "available_usdt": 0, "equity_usdt": 0, "open_positions": 0,
-                "open_orders": 0},
+                "open_orders": 0,
+                # Diagnostic fields populated by _bitunix_request on every call.
+                # Surfaced unauthenticated through /bitunix/exchange/status so the
+                # user can debug 451/auth failures without needing an exec key.
+                "last_error_code":   None,
+                "last_error_msg":    None,
+                "last_attempt":      None,
+                "last_path":         None,
+                "query_string_used": None},
 }
+# Cached on first successful lookup so we don't hammer ipify; surfaced via
+# /bitunix/exchange/status as `render_ip`.
+_bitunix_render_ip = None
 # Per-symbol cache so we only call set_leverage / set_margin_mode the first time
 # a venue/symbol pair is used in a session
 _bitunix_symbol_setup = set()
@@ -1741,13 +1752,25 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
             "timestamp": timestamp,
         })
 
-    # Build URL — wire query MUST equal the signed query_string byte-for-byte
+    # Build URL — wire query is standard ?key=value&key=value (NOT the
+    # concatenated form fed to the signer). The two strings are deliberately
+    # different and built from the same `params` so they can't drift.
     url = BITUNIX_BASE_URL + path
-    if query_string:
-        url = url + "?" + query_string
+    wire_params = sorted(((k, v) for k, v in params.items() if v is not None),
+                         key=lambda kv: kv[0])
+    if wire_params:
+        url = url + "?" + urlencode(wire_params)
 
     # Mask api-key in any log output — first 8 chars only
     key_prefix = (BITUNIX_API_KEY or "")[:8]
+
+    # Diagnostic capture — recorded BEFORE the request so even network failures
+    # leave a trail in /bitunix/exchange/status. Only auth-relevant fields go
+    # in; we never log secrets here.
+    bitunix_diag = _exchange_status.get("bitunix", {})
+    bitunix_diag["last_attempt"]      = datetime.now(timezone.utc).isoformat()
+    bitunix_diag["last_path"]         = f"{method} {path}"
+    bitunix_diag["query_string_used"] = query_string
 
     try:
         if method == "GET":
@@ -1756,15 +1779,21 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
             r = requests.request(method, url, headers=headers, data=body_string.encode("utf-8"), timeout=15)
     except requests.RequestException as e:
         logging.warning("Bitunix request failed [key=%s…] %s %s: %s", key_prefix, method, path, e)
+        bitunix_diag["last_error_code"] = None
+        bitunix_diag["last_error_msg"]  = f"network: {e}"
         raise RuntimeError(f"Bitunix request failed: {e}") from e
 
     if r.status_code in (451, 403):
         logging.warning("Bitunix geo-blocked/forbidden [key=%s…] %s %s status=%s body=%s",
                         key_prefix, method, path, r.status_code, (r.text or "")[:500])
+        bitunix_diag["last_error_code"] = r.status_code
+        bitunix_diag["last_error_msg"]  = f"HTTP {r.status_code} (geo-blocked or forbidden)"
         raise ConnectionError("Bitunix geo-blocked or forbidden")
     if not r.ok:
         logging.warning("Bitunix HTTP %s [key=%s…] %s %s body=%s",
                         r.status_code, key_prefix, method, path, (r.text or "")[:500])
+        bitunix_diag["last_error_code"] = r.status_code
+        bitunix_diag["last_error_msg"]  = f"HTTP {r.status_code}: {(r.text or '')[:200]}"
         r.raise_for_status()
 
     try:
@@ -1772,6 +1801,8 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
     except ValueError as e:
         logging.warning("Bitunix non-JSON response [key=%s…] %s %s body=%s",
                         key_prefix, method, path, (r.text or "")[:500])
+        bitunix_diag["last_error_code"] = r.status_code
+        bitunix_diag["last_error_msg"]  = f"non-JSON: {(r.text or '')[:200]}"
         raise RuntimeError(f"Bitunix returned non-JSON: {r.text[:200]}") from e
 
     code = data.get("code")
@@ -1779,12 +1810,17 @@ def _bitunix_request(method, path, params=None, body=None, signed=True):
         msg = data.get("msg") or data.get("message") or "Unknown error"
         logging.warning("Bitunix API error [key=%s…] %s %s code=%s msg=%s",
                         key_prefix, method, path, code, msg)
+        bitunix_diag["last_error_code"] = code
+        bitunix_diag["last_error_msg"]  = msg
         # Auth-style errors → propagate so caller can disable integration
         if code in (10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008,
                     10009, 10010, 10011, 10012):
             raise RuntimeError(f"Bitunix auth error (code {code}): {msg}")
         raise RuntimeError(f"Bitunix API error (code {code}): {msg}")
 
+    # Success — clear the error trail
+    bitunix_diag["last_error_code"] = None
+    bitunix_diag["last_error_msg"]  = None
     return data
 
 
@@ -2434,10 +2470,120 @@ def bitunix_limit_expiry_monitor():
 
 # ── Bitunix Flask Routes ───────────────────────────────
 
+def _bitunix_get_render_ip():
+    """Lookup-once helper. Cached in module global so we don't hammer ipify."""
+    global _bitunix_render_ip
+    if _bitunix_render_ip is None:
+        try:
+            _bitunix_render_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        except Exception as e:
+            _bitunix_render_ip = f"<lookup failed: {e}>"
+    return _bitunix_render_ip
+
+
 @app.route("/bitunix/exchange/status", methods=["GET"])
 def bitunix_exchange_status():
-    """GET /bitunix/exchange/status — connection state for Bitunix only."""
-    return jsonify(_exchange_status.get("bitunix", {}))
+    """GET /bitunix/exchange/status — connection state for Bitunix only.
+
+    Public (no auth) — returns enough signing diagnostics to debug auth
+    failures without an exec key. Never includes the API key or secret.
+    """
+    base = dict(_exchange_status.get("bitunix", {}))
+    base["signing_format"] = "concatenated_v2"
+    base["render_ip"]      = _bitunix_get_render_ip()
+    base["api_key_prefix"] = (BITUNIX_API_KEY or "")[:8] + ("…" if BITUNIX_API_KEY else "")
+    base["api_key_set"]    = bool(BITUNIX_API_KEY)
+    base["api_secret_set"] = bool(BITUNIX_API_SECRET)
+    base["paper_mode"]     = PAPER_TRADING_MODE
+    return jsonify(base)
+
+
+@app.route("/bitunix/reconnect", methods=["GET"])
+def bitunix_reconnect():
+    """GET /bitunix/reconnect — force an immediate fresh connection attempt.
+
+    Public (no auth). Clears the disabled flag if it was tripped, hits the
+    Bitunix account endpoint, and returns the raw response. Designed for
+    debugging from a browser or curl — surfaces exactly what Bitunix sent
+    back on this attempt without going through the 60s sync loop.
+    """
+    if not BITUNIX_API_KEY or not BITUNIX_API_SECRET:
+        return jsonify({
+            "ok":      False,
+            "stage":   "config",
+            "error":   "BITUNIX_API_KEY / BITUNIX_API_SECRET not set on the server",
+            "render_ip": _bitunix_get_render_ip(),
+        }), 400
+    # Force a fresh attempt — the auto-disable circuit breaker would otherwise
+    # short-circuit the call.
+    _exchange_status["bitunix"]["disabled"] = False
+    _exchange_status["bitunix"]["error"]    = None
+    try:
+        bal = bitunix_get_balance()
+        _exchange_status["bitunix"]["connected"]      = True
+        _exchange_status["bitunix"]["balance_usdt"]   = bal.get("balance", 0)
+        _exchange_status["bitunix"]["available_usdt"] = bal.get("available", 0)
+        _exchange_status["bitunix"]["equity_usdt"]    = bal.get("equity", 0)
+        _exchange_status["bitunix"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+        return jsonify({
+            "ok":        True,
+            "stage":     "balance",
+            "balance":   bal,
+            "render_ip": _bitunix_get_render_ip(),
+            "diag": {
+                "last_path":         _exchange_status["bitunix"].get("last_path"),
+                "query_string_used": _exchange_status["bitunix"].get("query_string_used"),
+                "signing_format":    "concatenated_v2",
+            },
+        })
+    except Exception as e:
+        _exchange_status["bitunix"]["connected"] = False
+        return jsonify({
+            "ok":        False,
+            "stage":     "balance",
+            "error":     str(e),
+            "render_ip": _bitunix_get_render_ip(),
+            "diag": {
+                "last_error_code":   _exchange_status["bitunix"].get("last_error_code"),
+                "last_error_msg":    _exchange_status["bitunix"].get("last_error_msg"),
+                "last_path":         _exchange_status["bitunix"].get("last_path"),
+                "query_string_used": _exchange_status["bitunix"].get("query_string_used"),
+                "signing_format":    "concatenated_v2",
+                "api_key_prefix":    (BITUNIX_API_KEY or "")[:8] + "…",
+            },
+        }), 500
+
+
+@app.route("/bitunix/ping-public", methods=["GET"])
+def bitunix_ping_public():
+    """GET /bitunix/ping-public — unauthenticated reachability check.
+
+    Hits Bitunix's public tickers endpoint, which requires no signing.
+    Confirms whether the backend can talk to Bitunix at all. If this fails,
+    we have a network/geo issue — not an auth issue.
+    """
+    url = BITUNIX_BASE_URL + "/api/v1/futures/market/tickers"
+    try:
+        r = requests.get(url, params={"symbols": "BTCUSDT"}, timeout=10)
+        ok = r.ok
+        try:
+            body = r.json()
+        except ValueError:
+            body = (r.text or "")[:500]
+        return jsonify({
+            "ok":          ok and isinstance(body, dict) and body.get("code") == 0,
+            "http_status": r.status_code,
+            "response":    body,
+            "render_ip":   _bitunix_get_render_ip(),
+            "url":         url + "?symbols=BTCUSDT",
+        })
+    except Exception as e:
+        return jsonify({
+            "ok":        False,
+            "error":     str(e),
+            "render_ip": _bitunix_get_render_ip(),
+            "url":       url + "?symbols=BTCUSDT",
+        }), 500
 
 
 @app.route("/bitunix/debug-auth", methods=["GET"])
@@ -2476,9 +2622,13 @@ def bitunix_debug_auth():
     sign = hashlib.sha256(sign_input.encode("utf-8")).hexdigest()
 
     # 3) Make the live call directly with requests — NOT through _bitunix_request
+    # Wire URL uses standard urlencoded form (?key=value&key=value); only the
+    # signed `query_string` above uses the Bitunix concatenated form.
     url = BITUNIX_BASE_URL + "/api/v1/futures/account"
-    if query_string:
-        url = url + "?" + query_string
+    wire_params = sorted(((k, v) for k, v in params.items() if v is not None),
+                         key=lambda kv: kv[0])
+    if wire_params:
+        url = url + "?" + urlencode(wire_params)
     headers = {
         "api-key":      BITUNIX_API_KEY,
         "sign":         sign,
