@@ -460,9 +460,11 @@ def send_telegram(text):
 
 def format_alert_message(alert, current_price):
     """Format the Telegram alert message using exact trading system lingo."""
-    symbol = alert["symbol"]
-    price = alert["price"]
-    label = alert["label"]
+    symbol    = alert["symbol"]
+    price     = alert["price"]
+    # Phase 7 \u2014 prefer the new `zone_type` field, fall back to legacy `label`
+    zone      = alert.get("zone_type") or alert.get("label") or "Custom"
+    notes     = (alert.get("notes") or "").strip()
     direction = alert.get("direction", "crosses_below")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -471,10 +473,13 @@ def format_alert_message(alert, current_price):
     else:
         crossed_text = "Below \u2192 Above"
 
+    notes_line = f"\U0001f4dd Note: {notes}\n" if notes else ""
+
     msg = (
         f"\U0001f6a8 <b>PRICE ALERT \u2014 {symbol}</b>\n\n"
         f"\U0001f4cd Level: <b>${price:,.2f}</b>\n"
-        f"\U0001f3f7 Zone: <b>{label}</b>\n"
+        f"\U0001f3f7 Zone: <b>{zone}</b>\n"
+        f"{notes_line}"
         f"\U0001f4ca Crossed: {crossed_text}\n"
         f"\u23f0 Time: {now}\n"
         f"\U0001f4b0 Current price: ${current_price:,.2f}\n\n"
@@ -572,15 +577,25 @@ def create_alert():
     if not body or not body.get("symbol") or not body.get("price"):
         return jsonify({"error": "symbol and price required"}), 400
 
+    # Phase 7 schema additions:
+    #   - `zone_type` is the new preferred name for the trading-system label
+    #     ("SC Zone", "$ Liquidity", etc). `label` stays as a backward-compat
+    #     alias so existing alerts and integrations keep working.
+    #   - `notes` is optional free text shown in the Telegram fire message.
+    zone_type = (body.get("zone_type") or body.get("label") or "Custom").strip()
+    notes     = (body.get("notes") or "").strip()
+
     alert = {
-        "id": str(uuid.uuid4())[:8],
-        "symbol": body["symbol"].upper(),
-        "price": float(body["price"]),
-        "label": body.get("label", "Custom"),
-        "direction": body.get("direction", "crosses_below"),
-        "active": True,
-        "triggered": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "id":           str(uuid.uuid4())[:8],
+        "symbol":       body["symbol"].upper(),
+        "price":        float(body["price"]),
+        "label":        zone_type,   # legacy alias — same value
+        "zone_type":    zone_type,
+        "notes":        notes,
+        "direction":    body.get("direction", "crosses_below"),
+        "active":       True,
+        "triggered":    False,
+        "created_at":   datetime.now(timezone.utc).isoformat(),
         "triggered_at": None,
     }
 
@@ -643,6 +658,33 @@ def price_endpoint(symbol):
         return jsonify({"symbol": symbol.upper(), "price": p})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/price/multi", methods=["GET"])
+def price_multi():
+    """GET /price/multi — fetch BTCUSDT + ETHUSDT in one call.
+
+    Phase 7 alerts tab uses this to populate the live-price cards without
+    firing two separate `/price/<symbol>` requests every 30s. Optional
+    `symbols=` query string (comma-separated) overrides the default pair.
+    Per-symbol failures are reported in `errors` instead of failing the
+    whole call — the alerts tab degrades gracefully.
+    """
+    raw = request.args.get("symbols", "BTCUSDT,ETHUSDT")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    prices, errors = {}, {}
+    for sym in symbols:
+        try:
+            prices[sym] = get_price(sym)
+        except Exception as e:
+            errors[sym] = str(e)
+    resp = {
+        "prices":       prices,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+    if errors:
+        resp["errors"] = errors
+    return jsonify(resp)
 
 
 @app.route("/ai-levels", methods=["POST"])
