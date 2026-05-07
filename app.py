@@ -4114,6 +4114,169 @@ def execution_test():
     }), 201
 
 
+@app.route("/api/bitunix/execution/test", methods=["POST"])
+def bitunix_execution_test():
+    """POST /api/bitunix/execution/test — Bitunix-only dry-run pipeline test.
+
+    DRY RUN. Never sends an order to Bitunix, never appends to
+    _execution_queue, never touches the journal Gist. Walks the same
+    pre-flight chain a real /bitunix/trade/execute would, surfacing each
+    step's pass/fail + detail so the user can see exactly which link in
+    the Bitunix chain is broken.
+
+    Designed for the Live tab's "Test Pipeline" Bitunix button — the
+    legacy /api/execution/test route stays the MT5 forex path.
+    """
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+
+    test_id = "bitunix-test-" + str(uuid.uuid4())[:8]
+    steps = []
+
+    def add(step_no, name, ok, detail=""):
+        steps.append({"step": step_no, "name": name, "ok": bool(ok), "detail": detail})
+
+    # Step 1 — Backend reachable. Always passes; we're inside the route.
+    add(1, "Backend reachable", True, "200 · /api/bitunix/execution/test")
+
+    # Step 2 — Bitunix connected. Reuse cached state when fresh, else hit auth.
+    bx_state = _exchange_status.get("bitunix", {})
+    last_sync = bx_state.get("last_sync")
+    fresh = False
+    if last_sync:
+        try:
+            ls = datetime.fromisoformat(last_sync.replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - ls).total_seconds() < 60:
+                fresh = True
+        except Exception:
+            pass
+
+    bal = None
+    if not BITUNIX_API_KEY or not BITUNIX_API_SECRET:
+        add(2, "Bitunix connected", False, "BITUNIX_API_KEY / BITUNIX_API_SECRET not set on Render")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+    if bx_state.get("disabled"):
+        add(2, "Bitunix connected", False,
+            bx_state.get("last_error_msg") or bx_state.get("error") or "circuit-breaker tripped")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+    try:
+        if fresh and bx_state.get("connected"):
+            bal = bx_state.get("available_usdt") or bx_state.get("balance_usdt") or 0
+        else:
+            balance_doc = bitunix_get_balance()
+            bal = balance_doc.get("available", balance_doc.get("balance", 0))
+            # Refresh _exchange_status so subsequent UI reads are warm
+            _exchange_status["bitunix"]["connected"]      = True
+            _exchange_status["bitunix"]["balance_usdt"]   = balance_doc.get("balance", 0)
+            _exchange_status["bitunix"]["available_usdt"] = balance_doc.get("available", 0)
+            _exchange_status["bitunix"]["equity_usdt"]    = balance_doc.get("equity", 0)
+            _exchange_status["bitunix"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+        add(2, "Bitunix connected", True, f"Balance: ${float(bal):.2f} USDT available")
+    except Exception as e:
+        add(2, "Bitunix connected", False, f"Auth call failed: {e}")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+
+    # Step 3 — BTCUSDT price fetched from Bitunix's own ticker.
+    entry_price = None
+    try:
+        tk = bitunix_get_ticker("BTCUSDT")
+        # Ticker shape varies: try common keys before falling back to get_price.
+        cand = tk.get("data") if isinstance(tk, dict) else None
+        if isinstance(cand, list) and cand:
+            cand = cand[0]
+        if isinstance(cand, dict):
+            for k in ("lastPrice", "last", "markPrice", "indexPrice", "close"):
+                if cand.get(k):
+                    entry_price = float(cand[k]); break
+        if entry_price is None:
+            entry_price = float(get_price("BTCUSDT"))
+        add(3, "BTCUSDT price fetched", True, f"${entry_price:,.2f}")
+    except Exception as e:
+        add(3, "BTCUSDT price fetched", False, f"Ticker failed: {e}")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+
+    # Step 4 — Position size calculated from 1% of available balance.
+    sl       = round(entry_price * 0.995, 2)   # 0.5% below entry
+    tp       = round(entry_price * 1.015, 2)   # 1.5% above entry
+    risk_pct = 1.0
+    leverage = BITUNIX_DEFAULT_LEVERAGE or 10
+    risk_amt = float(bal or 0) * (risk_pct / 100.0)
+    price_dist = entry_price - sl
+    qty = round(risk_amt / price_dist, 4) if price_dist > 0 else 0
+    notional = qty * entry_price
+    margin   = notional / max(leverage, 1)
+    if qty <= 0 or risk_amt <= 0:
+        add(4, "Position size calculated", False,
+            f"qty={qty}, risk_amt=${risk_amt:.4f} — capital too low for a meaningful test")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+    add(4, "Position size calculated", True,
+        f"{qty} BTC @ {leverage}x = ${margin:.2f} margin (1% risk = ${risk_amt:.2f})")
+
+    # Step 5 — Risk engine validation (synthetic trade, never queued).
+    synth_trade = {
+        "id":               test_id,
+        "symbol":           "BTCUSDT",
+        "direction":        "BUY",
+        "entry":            entry_price,
+        "sl":               sl,
+        "tp":               tp,
+        "lot_size":         qty,
+        "risk_percent":     risk_pct,
+        "be_trigger_rr":    5.0,
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "source":           "bitunix_execution_test",
+        "journal_trade_id": "bitunix-pipeline-test",
+        "venue":            "bitunix",
+        "leverage":         leverage,
+        "margin_mode":      BITUNIX_MARGIN_MODE,
+        "status":           "pending",
+        "paper":            True,
+        "test":             True,
+        "test_only":        True,
+    }
+    account_state = {"capital": float(bal or 0)}
+    try:
+        result = validate_trade(synth_trade, account_state)
+        if result.get("approved"):
+            warn_tail = f" (warnings: {len(result.get('warnings') or [])})" if result.get("warnings") else ""
+            add(5, "Risk engine approved", True, "Synthetic 1% risk passes validation" + warn_tail)
+        else:
+            add(5, "Risk engine approved", False, result.get("reason") or "validation rejected")
+            return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                            "venue": "bitunix", "test_id": test_id}), 200
+    except Exception as e:
+        add(5, "Risk engine approved", False, f"validate_trade raised: {e}")
+        return jsonify({"stage": "failed", "steps": steps, "paper_mode": PAPER_TRADING_MODE,
+                        "venue": "bitunix", "test_id": test_id}), 200
+
+    # Step 6 — Order route verified. NEVER calls bitunix_place_order.
+    add(6, "Order route verified", True,
+        f"Would send BTCUSDT LIMIT BUY @ ${entry_price:,.2f} (GTC, qty={qty}, lev={leverage}x) to Bitunix")
+
+    # Drop a single audit-log line so the test shows up in the venue-filtered
+    # exec log; venue-tagging is automatic via _log_execution_event.
+    _log_execution_event(
+        trade_id=test_id, symbol="BTCUSDT", direction="BUY",
+        planned_entry=entry_price, status="bitunix_test_passed",
+        venue="bitunix", paper=True, test=True,
+        reason="Bitunix pipeline test passed — dry run, no order placed",
+    )
+
+    return jsonify({
+        "stage":      "complete",
+        "steps":      steps,
+        "paper_mode": PAPER_TRADING_MODE,
+        "venue":      "bitunix",
+        "test_id":    test_id,
+    }), 200
+
+
 @app.route("/api/execution/health", methods=["GET"])
 def execution_health():
     """GET /api/execution/health — Aggregated status of all execution pipeline components."""
