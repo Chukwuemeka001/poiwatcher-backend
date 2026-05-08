@@ -52,6 +52,10 @@ BITUNIX_API_KEY = os.environ.get("BITUNIX_API_KEY", "")
 BITUNIX_API_SECRET = os.environ.get("BITUNIX_API_SECRET", "")
 BITUNIX_DEFAULT_LEVERAGE = int(os.environ.get("BITUNIX_DEFAULT_LEVERAGE", "10") or "10")
 BITUNIX_MARGIN_MODE = (os.environ.get("BITUNIX_MARGIN_MODE", "CROSS") or "CROSS").upper()
+# Default break-even trigger R:R for Bitunix positions. Mirrors the MT5 EA's
+# BreakEvenRR=1.5 default; per-trade override comes from the journal row's
+# `be_trigger_rr` field (set in Settings → Risk Limits → Break Even Trigger).
+BITUNIX_DEFAULT_BE_RR = float(os.environ.get("BITUNIX_DEFAULT_BE_RR", "1.5") or "1.5")
 BITUNIX_BASE_URL = "https://fapi.bitunix.com"
 
 # ── Symbol mapping for multi-source APIs ──
@@ -577,6 +581,8 @@ last_prices = {}  # symbol -> last known price
 
 def check_alerts():
     """Check all active alerts against current prices."""
+    global _alert_monitor_last_run
+    _alert_monitor_last_run = datetime.now(timezone.utc).isoformat()
     alerts = get_alerts()
     if not alerts:
         return
@@ -641,7 +647,18 @@ def price_monitor_loop():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
+    """Lightweight health probe — also serves as the UptimeRobot keepalive
+    target (poll every 5 min to prevent Render free-tier sleep). Surfaces
+    monitor heartbeats so a stale `*_last_run` makes a sleeping dyno
+    obvious without combing through logs.
+    """
+    return jsonify({
+        "status":                    "ok",
+        "time":                      datetime.now(timezone.utc).isoformat(),
+        "uptime_seconds":            int(time.time() - _app_start_time),
+        "position_monitor_last_run": _position_monitor_last_run,
+        "alert_monitor_last_run":    _alert_monitor_last_run,
+    })
 
 
 @app.route("/debug/gist", methods=["GET"])
@@ -1528,12 +1545,27 @@ _bitunix_render_ip = None
 # Per-symbol cache so we only call set_leverage / set_margin_mode the first time
 # a venue/symbol pair is used in a session
 _bitunix_symbol_setup = set()
-# Positions where SL has already been moved to entry (1:5 R:R)
-_bitunix_be_alerted = set()
+# Positions where SL has already been moved to entry — single source of truth
+# for BE deduplication. The position monitor adds a positionId here on success;
+# the close monitor discards it when the position closes so a re-open with the
+# same positionId can re-trigger.
+_be_set_positions = set()
+# Legacy alias kept so any inflight code paths that still read the old name
+# don't break. Both names point to the same underlying set.
+_bitunix_be_alerted = _be_set_positions
 # Track already-logged trade IDs to avoid duplicates (loaded from Gist)
 _logged_trade_ids = set()
 # Track positions already alerted for 1:5 R:R (reset on restart)
 _be_alerted_positions = set()
+
+# ── Heartbeat tracking (Phase 7.3) ────────────────────────────────────
+# Stamped at the start of each monitor run so /health can report whether
+# the background loops are actually running. Free-tier Render sleeps after
+# ~15min of no HTTP traffic; UptimeRobot pings /health every 5min to keep
+# the dyno awake. These timestamps prove the monitors actually ticked.
+_app_start_time              = time.time()
+_position_monitor_last_run   = None  # bitunix_position_monitor stamps this
+_alert_monitor_last_run      = None  # check_alerts stamps this
 
 
 # ── Binance Private API Signing ─────────────────────────
@@ -2180,7 +2212,17 @@ def _price_bitunix(symbol):
 # ── Bitunix Position Monitor (1:5 R:R Break Even) ──────
 
 def bitunix_position_monitor():
-    """Auto-move SL to entry once a Bitunix position reaches 1:5 R:R."""
+    """Auto-move SL to entry once a Bitunix position reaches its BE trigger R:R.
+
+    The trigger value is read from the matching journal row's `be_trigger_rr`
+    field (configurable in Settings → Risk Limits → Break Even Trigger), with
+    a default of 1.5R to match the MT5 EA's BreakEvenRR=1.5. The R:R math uses
+    the PLANNED SL from the journal row (not the position's current SL) so a
+    partial SL move won't poison the calculation.
+    """
+    global _position_monitor_last_run
+    _position_monitor_last_run = datetime.now(timezone.utc).isoformat()
+
     if _exchange_status["bitunix"]["disabled"] or not BITUNIX_API_KEY:
         return
     try:
@@ -2193,54 +2235,115 @@ def bitunix_position_monitor():
 
     _exchange_status["bitunix"]["open_positions"] = len(positions)
 
+    # Prune _be_set_positions — keep only ids still present in the open
+    # positions list. A closed-and-reopened position with a fresh positionId
+    # gets a clean slate; a closed-and-not-reopened id is evicted so memory
+    # doesn't grow unbounded across the daemon's lifetime.
+    open_ids = {str(p.get("positionId", "")) for p in positions if p.get("positionId")}
+    _be_set_positions.intersection_update(open_ids)
+
+    # Look up the journal once per cycle so we don't read the gist N times
+    journal_trades = None
+    def _journal():
+        nonlocal journal_trades
+        if journal_trades is None:
+            try:
+                journal_trades = get_trades() or []
+            except Exception:
+                journal_trades = []
+        return journal_trades
+
+    def _find_trade_by_client(cid):
+        if not cid: return None
+        for t in _journal():
+            if t.get("id") == cid or t.get("journalTradeId") == cid:
+                return t
+        return None
+
     for p in positions:
         try:
-            pos_id  = str(p.get("positionId", ""))
-            symbol  = p.get("symbol", "")
-            side    = (p.get("side") or "").upper()  # BUY (long) or SELL (short)
-            entry   = float(p.get("avgOpenPrice", p.get("entryValue", 0)) or 0)
-            sl_price = float(p.get("slPrice", 0) or 0) if p.get("slPrice") else 0
-            mark     = float(p.get("markPrice", p.get("lastPrice", 0)) or 0)
+            pos_id    = str(p.get("positionId", ""))
+            symbol    = p.get("symbol", "")
+            side      = (p.get("side") or "").upper()
+            entry     = float(p.get("avgOpenPrice", p.get("entryValue", 0)) or 0)
+            mark      = float(p.get("markPrice", p.get("lastPrice", 0)) or 0)
+            pos_sl    = float(p.get("slPrice", 0) or 0) if p.get("slPrice") else 0
             client_id = p.get("clientId") or ""
 
-            if not pos_id or not entry or not mark or not sl_price:
+            if not pos_id or not entry or not mark:
                 continue
-            if pos_id in _bitunix_be_alerted:
+            if pos_id in _be_set_positions:
                 continue
 
-            # R-distance = entry - SL (long) or SL - entry (short)
+            # Pull the planned SL + per-trade trigger from the journal. Fall
+            # back to the position's current SL only if no journal match.
+            jrow = _find_trade_by_client(client_id)
+            planned_sl = None
+            trigger_rr = None
+            if jrow:
+                try:
+                    planned_sl = float(jrow.get("sl") or 0) or None
+                except (TypeError, ValueError):
+                    planned_sl = None
+                try:
+                    trigger_rr = float(jrow.get("be_trigger_rr") or jrow.get("beTriggerRR") or 0) or None
+                except (TypeError, ValueError):
+                    trigger_rr = None
+            sl_for_calc = planned_sl if planned_sl else pos_sl
+            if not sl_for_calc:
+                continue
+            # Default 1.5R unless the trade row carries a different value.
+            # Matches MT5 EA's BreakEvenRR=1.5; user-configurable in Settings.
+            if not trigger_rr or trigger_rr <= 0:
+                trigger_rr = BITUNIX_DEFAULT_BE_RR
+
+            # R-distance = entry - SL (long) or SL - entry (short). Uses the
+            # PLANNED SL so a partial SL adjustment doesn't break the calc.
             if side == "BUY":
-                r_dist = entry - sl_price
+                r_dist = entry - sl_for_calc
                 progress = (mark - entry)
             else:
-                r_dist = sl_price - entry
+                r_dist = sl_for_calc - entry
                 progress = (entry - mark)
             if r_dist <= 0:
                 continue
 
             rr = progress / r_dist
-            if rr < 5.0:
+            if rr < trigger_rr:
                 continue
 
-            # Already at 1:5 R:R — move SL to entry
+            # Trigger reached — move SL to entry on Bitunix
+            modify_resp = None
             try:
-                bitunix_modify_position_sl(symbol, pos_id, entry)
-                _bitunix_be_alerted.add(pos_id)
+                modify_resp = bitunix_modify_position_sl(symbol, pos_id, entry)
+                _be_set_positions.add(pos_id)
             except Exception as e:
-                logging.warning("Bitunix BE modify failed for %s: %s", pos_id, e)
+                logging.warning("Bitunix BE modify failed for %s (rr=%.2f, trigger=%.2f): %s",
+                                pos_id, rr, trigger_rr, e)
                 continue
 
-            # Patch the journal row if we can match by clientId/journal_trade_id
+            # Pull a confirmation hint from the modify response so the audit
+            # log shows the exchange-acknowledged slPrice, not just our intent.
+            confirm = ""
             try:
-                if client_id:
-                    trades_list = get_trades()
-                    for t in trades_list:
-                        if t.get("id") == client_id or t.get("journalTradeId") == client_id:
-                            t["breakEvenSet"]   = True
-                            t["bitunixBEAt"]    = datetime.now(timezone.utc).isoformat()
-                            t["updatedAt"]      = t["bitunixBEAt"]
-                            break
-                    save_trades(trades_list)
+                d = (modify_resp or {}).get("data") or {}
+                if isinstance(d, dict):
+                    cs = d.get("slPrice") or d.get("sl") or d.get("positionId")
+                    if cs is not None:
+                        confirm = f"; ack={cs}"
+            except Exception:
+                pass
+            logging.info("Bitunix BE set: pos=%s symbol=%s rr=%.2f trigger=%.2f new_sl=%s%s",
+                         pos_id, symbol, rr, trigger_rr, entry, confirm)
+
+            # Patch the journal row if we matched
+            try:
+                if client_id and jrow:
+                    jrow["breakEvenSet"]   = True
+                    jrow["bitunixBEAt"]    = datetime.now(timezone.utc).isoformat()
+                    jrow["bitunixBETriggerRR"] = trigger_rr
+                    jrow["updatedAt"]      = jrow["bitunixBEAt"]
+                    save_trades(_journal())
             except Exception as e:
                 logging.warning("Bitunix BE journal patch failed: %s", e)
 
@@ -2251,18 +2354,18 @@ def bitunix_position_monitor():
                 planned_entry=entry, actual_entry=mark,
                 status="bitunix_be_set", venue="bitunix",
                 bitunix_order_id=str(pos_id or ""),
-                reason=f"BE set at 1:5 R:R (R={rr:.2f})",
+                reason=f"BE set at 1:{trigger_rr:g} R:R (R={rr:.2f}{confirm})",
             )
             msg = (
                 f"\U0001f512 <b>Break even set on Bitunix!</b>\n\n"
                 f"<b>{symbol}</b> {direction_label}\n"
                 f"Trade is now RISK FREE \u2705\n"
                 f"SL moved to entry: <b>{entry}</b>\n"
-                f"\U0001f4ca Mark: {mark} (R = {rr:.2f})\n\n"
+                f"\U0001f4ca Mark: {mark} (R = {rr:.2f}, trigger 1:{trigger_rr:g})\n\n"
                 f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
             )
             send_telegram(msg)
-            logging.info("Bitunix BE set on position %s %s @ entry=%s mark=%s", pos_id, symbol, entry, mark)
+            logging.info("Bitunix BE set on position %s %s @ entry=%s mark=%s trigger=%s", pos_id, symbol, entry, mark, trigger_rr)
         except Exception as e:
             logging.warning("Bitunix position monitor — per-position error: %s", e)
 
@@ -4683,9 +4786,18 @@ def _start_background_threads():
     except Exception as e:
         logging.warning("Bitunix: could not determine outbound IP: %s", e)
     threading.Thread(target=price_monitor_loop, daemon=True).start()
-    if BINANCE_API_KEY:
+    # Start the exchange sync loop whenever any exchange is configured. The
+    # loop body has its own per-venue guards, so a Bitunix-only setup just
+    # runs the Bitunix branch (Binance branch is no-op without its key).
+    # Previously this was gated only on BINANCE_API_KEY — meaning Bitunix-only
+    # users never had their position monitor / close monitor / limit-expiry
+    # monitor run, and BE never fired.
+    if BINANCE_API_KEY or BITUNIX_API_KEY:
         threading.Thread(target=exchange_sync_loop, daemon=True).start()
-        logging.info("Exchange sync started — Binance: enabled")
+        venues = []
+        if BINANCE_API_KEY: venues.append("Binance")
+        if BITUNIX_API_KEY: venues.append("Bitunix")
+        logging.info("Exchange sync started — venues: %s", ", ".join(venues))
     threading.Thread(target=daily_summary_loop, daemon=True).start()
 
 
