@@ -645,13 +645,68 @@ def price_monitor_loop():
 
 # ── Flask routes ────────────────────────────────────────
 
+def _stale_iso(ts_str, max_age_seconds):
+    """Helper — was this ISO timestamp written more than `max_age_seconds` ago?
+    Returns True if the timestamp is None or unparseable."""
+    if not ts_str:
+        return True
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds() > max_age_seconds
+    except Exception:
+        return True
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    """Lightweight health probe — also serves as the UptimeRobot keepalive
-    target (poll every 5 min to prevent Render free-tier sleep). Surfaces
-    monitor heartbeats so a stale `*_last_run` makes a sleeping dyno
-    obvious without combing through logs.
+    """Lightweight health probe + monitor self-tick.
+
+    On Render's free tier, gunicorn's daemon-thread CPU is unreliable: the
+    `price_monitor_loop` and `exchange_sync_loop` start up and run their first
+    iteration, then get starved past that point — they don't tick on their
+    60s schedule. UptimeRobot pinging /health every 5 min keeps the dyno
+    awake, but doesn't fix daemon starvation.
+
+    This route runs the monitors INLINE on the request-handler thread (which
+    DOES get reliable CPU) whenever they've gone stale (>90s since last
+    tick). UptimeRobot's 5-min cadence then becomes the effective monitor
+    schedule. Each tick runs in 1-3s, well under any reasonable HTTP timeout.
     """
+    # Run alert checker inline if stale
+    if _stale_iso(_alert_monitor_last_run, 90):
+        try:
+            check_alerts()
+        except Exception as e:
+            logging.warning("/health inline check_alerts failed: %s", e)
+
+    # Run Bitunix monitor chain inline if stale + Bitunix configured + not disabled
+    bx = _exchange_status.get("bitunix", {})
+    if (BITUNIX_API_KEY and BITUNIX_API_SECRET
+            and not bx.get("disabled")
+            and _stale_iso(_position_monitor_last_run, 90)):
+        try:
+            bal = bitunix_get_balance()
+            _exchange_status["bitunix"]["connected"]      = True
+            _exchange_status["bitunix"]["balance_usdt"]   = bal["balance"]
+            _exchange_status["bitunix"]["available_usdt"] = bal["available"]
+            _exchange_status["bitunix"]["equity_usdt"]    = bal["equity"]
+            _exchange_status["bitunix"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+            _exchange_status["bitunix"]["error"]          = None
+            bitunix_trade_close_monitor()
+            bitunix_position_monitor()
+            bitunix_limit_expiry_monitor()
+        except ConnectionError:
+            _exchange_status["bitunix"]["disabled"]  = True
+            _exchange_status["bitunix"]["connected"] = False
+            _exchange_status["bitunix"]["error"]     = "Geo-blocked"
+            logging.warning("/health Bitunix monitor — geo-blocked")
+        except Exception as e:
+            if "auth" in str(e).lower() or "unauthorized" in str(e).lower() or "invalid api" in str(e).lower():
+                _exchange_status["bitunix"]["disabled"]  = True
+                _exchange_status["bitunix"]["connected"] = False
+            _exchange_status["bitunix"]["error"] = str(e)
+            logging.warning("/health Bitunix monitor failed: %s", e)
+
     return jsonify({
         "status":                    "ok",
         "time":                      datetime.now(timezone.utc).isoformat(),
