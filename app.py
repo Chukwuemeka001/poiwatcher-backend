@@ -3127,7 +3127,39 @@ def bitunix_trade_execute():
         "status":           "pending",
         "paper":            PAPER_TRADING_MODE,
     }
-    account_state = body.get("account_state") or _get_account_state_from_gist()
+    # Phase 7.6 — for Bitunix trades, ALWAYS source capital from the live
+    # Bitunix balance (not gist settings). The gist's settings.profile.capital
+    # can drift out of sync with the actual account (calculator session
+    # leftovers, multi-device settings overwrites). Sizing positions against
+    # stale capital is exactly what triggered the live "Insufficient balance"
+    # rejection. Falls back to gist + body only if Bitunix is unreachable AND
+    # we're in paper mode.
+    live_available = None
+    bitunix_live_err = None
+    try:
+        if BITUNIX_API_KEY and not _exchange_status["bitunix"]["disabled"]:
+            bal = bitunix_get_balance()
+            live_available = float(bal.get("available", bal.get("balance", 0)) or 0)
+            # Warm the cache so /bitunix/exchange/status reflects this fetch
+            _exchange_status["bitunix"]["connected"]      = True
+            _exchange_status["bitunix"]["balance_usdt"]   = bal.get("balance", 0)
+            _exchange_status["bitunix"]["available_usdt"] = bal.get("available", 0)
+            _exchange_status["bitunix"]["equity_usdt"]    = bal.get("equity", 0)
+            _exchange_status["bitunix"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        bitunix_live_err = str(e)
+        logging.warning("Bitunix live balance fetch failed before sizing: %s", e)
+
+    if live_available is not None and live_available > 0:
+        # Live balance is the source of truth.
+        account_state = {"capital": live_available, "_capital_source": "bitunix_live"}
+    else:
+        # Fallback chain: explicit body → gist settings. Only used when
+        # Bitunix is unreachable AND we're in paper mode (live mode would
+        # fail the pre-flight margin check below anyway).
+        account_state = body.get("account_state") or _get_account_state_from_gist()
+        account_state["_capital_source"] = "gist_fallback"
+
     result = validate_trade(trade, account_state)
 
     if not result["approved"]:
@@ -3165,9 +3197,45 @@ def bitunix_trade_execute():
     notional = qty * entry
     required_margin = notional / max(leverage, 1)
 
+    # Phase 7.6 — pre-flight margin check. Block here BEFORE we send to Bitunix
+    # so the user sees a clear "Insufficient margin: need $X, have $Y" error
+    # instead of the cryptic Bitunix "code 20003: Insufficient balance".
+    # Skip in paper mode (no real margin needed).
+    if not PAPER_TRADING_MODE and live_available is not None:
+        # 95% buffer leaves room for funding accruals / minor slippage.
+        usable = live_available * 0.95
+        if required_margin > usable:
+            # Compute the largest qty that would fit, rounded down to 4dp.
+            max_qty_raw = (usable * leverage) / entry if entry > 0 else 0
+            max_qty = max(0, int(max_qty_raw * 10000) / 10000)
+            suggestion = (
+                f"Reduce position to {max_qty} contracts at {leverage}x"
+                if max_qty > 0 else
+                f"Increase leverage above {leverage}x or reduce risk percent below {risk_pct}%"
+            )
+            trade["status"] = "execution_failed"
+            trade["error"]  = "pre_flight_insufficient_margin"
+            _log_execution_event(
+                trade_id=trade["id"], symbol=symbol, direction=direction,
+                planned_entry=entry, status="bitunix_execution_failed",
+                venue="bitunix",
+                reason=(f"Pre-flight insufficient margin: need ${required_margin:.2f}, "
+                        f"have ${live_available:.2f} available. {suggestion}"),
+            )
+            return jsonify({
+                "approved":         True,
+                "error":            "Insufficient margin",
+                "required_margin":  round(required_margin, 4),
+                "available_usdt":   round(live_available, 4),
+                "max_qty":          max_qty,
+                "suggestion":       suggestion,
+                "trade_id":         trade["id"],
+            }), 400
+
     trade["lot_size"]        = qty
     trade["notional"]        = notional
     trade["required_margin"] = required_margin
+    trade["available_usdt"]  = live_available  # Echo for the frontend
     trade["warnings"]        = result["warnings"]
     trade["status"]          = "approved"
     _execution_queue.append(trade)
