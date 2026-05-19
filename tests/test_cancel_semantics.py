@@ -136,6 +136,54 @@ class CancelSemanticsTests(unittest.TestCase):
         self.assertEqual(venues["mt5-1"], "mt5")
         self.assertEqual(venues["bitunix-1"], "bitunix")
         self.assertEqual([o for o in orders if o["id"] == "bitunix-1"][0]["client_id"], "bitunix-1")
+    def test_legacy_emergency_clear_endpoint_clears_stale_flags(self):
+        app_module._emergency_stop.update({"active": True, "at": "2026-01-01T00:00:00+00:00", "by": "test"})
+        app_module._mt4_emergency_stop = True
+        resp = self.client.delete("/api/execution/emergency_stop", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        self.assertFalse(app_module._emergency_stop["active"])
+        self.assertFalse(app_module._mt4_emergency_stop)
+
+    def test_bitunix_expiry_auto_cancels_only_when_exchange_verified(self):
+        app_module._pending_limit_orders.append({
+            "id": "expired-1",
+            "venue": "bitunix",
+            "client_id": "expired-1",
+            "symbol": "BTCUSDT",
+            "direction": "BUY",
+            "entry": 100000,
+            "order_ticket": "bx-expired",
+            "expires_at": "2026-01-01T00:00:00+00:00",
+            "status": "limit_placed",
+        })
+        app_module._exchange_status["bitunix"]["disabled"] = False
+        with patch.object(app_module, "BITUNIX_API_KEY", "key"), \
+             patch.object(app_module, "bitunix_cancel_order", return_value={"code": 0, "data": {"successList": [{"orderId": "bx-expired"}]}}), \
+             patch.object(app_module, "send_telegram"):
+            app_module.bitunix_limit_expiry_monitor()
+        self.assertEqual(app_module._pending_limit_orders[0]["status"], "bitunix_limit_expired_cancelled_verified")
+
+    def test_bitunix_expiry_keeps_order_pending_when_cancel_not_verified(self):
+        app_module._pending_limit_orders.append({
+            "id": "expired-2",
+            "venue": "bitunix",
+            "client_id": "expired-2",
+            "symbol": "BTCUSDT",
+            "direction": "SELL",
+            "entry": 100000,
+            "order_ticket": "bx-failed",
+            "expires_at": "2026-01-01T00:00:00+00:00",
+            "status": "limit_placed",
+        })
+        app_module._exchange_status["bitunix"]["disabled"] = False
+        with patch.object(app_module, "BITUNIX_API_KEY", "key"), \
+             patch.object(app_module, "bitunix_cancel_order", return_value={"code": 10001, "msg": "reject"}), \
+             patch.object(app_module, "send_telegram"):
+            app_module.bitunix_limit_expiry_monitor()
+        self.assertEqual(app_module._pending_limit_orders[0]["status"], "limit_placed")
+        self.assertIn("expiry_cancel_failed_at", app_module._pending_limit_orders[0])
 
 
 if __name__ == "__main__":

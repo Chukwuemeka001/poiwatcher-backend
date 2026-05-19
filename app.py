@@ -2730,13 +2730,14 @@ def bitunix_trade_close_monitor():
             bitunix_order_id=order_id,
             reason=f"{outcome_str} \u00b7 {close_reason} \u00b7 P&L ${pnl:.2f}",
         )
+        duration_display = duration_str or "—"
         msg = (
             f"\U0001f4ca <b>Bitunix trade CLOSED</b> \u2014 [{outcome_str}]\n\n"
             f"<b>{symbol}</b> {(direction or '').upper()}\n"
             f"Entry: <b>{entry_for_msg}</b> \u2192 Exit: <b>{exit_price}</b>\n"
             f"P&amp;L: <b>${pnl:+.2f}</b>\n"
             f"Actual R:R: <b>{rr_str}</b>\n"
-            f"Duration: {duration_str or '\u2014'}\n"
+            f"Duration: {duration_display}\n"
             f"Close reason: {close_reason}\n\n"
             f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal to add post-trade review</a>"
         )
@@ -2753,18 +2754,19 @@ def bitunix_trade_close_monitor():
 
 
 def bitunix_limit_expiry_monitor():
-    """Mark pending Bitunix limit orders as expired after their 24h window.
+    """Actively cancel stale Bitunix limit orders after their 24h window.
 
-    Mirrors the MT5 limit-expiry behavior: emits `bitunix_limit_expired` to the
-    execution log and fires a Telegram so the user knows the order is stale.
-    The actual cancel is the user's responsibility (or Bitunix server-side if
-    they configured GTC). We never auto-cancel here to avoid surprising flips.
+    A stale Bitunix order is still real exchange risk. Do not mark it expired
+    unless Bitunix confirms cancellation. If cancellation is ambiguous/failed,
+    keep it pending and log/notify that manual exchange verification is needed.
     """
     if _exchange_status["bitunix"]["disabled"] or not BITUNIX_API_KEY:
         return
     now = datetime.now(timezone.utc)
     for lo in _pending_limit_orders:
         if lo.get("venue") != "bitunix" or lo.get("status") != "limit_placed":
+            continue
+        if lo.get("expiry_cancel_attempted_at"):
             continue
         try:
             exp = datetime.fromisoformat(str(lo.get("expires_at", "")).replace("Z", "+00:00"))
@@ -2774,28 +2776,61 @@ def bitunix_limit_expiry_monitor():
             continue
         if now < exp:
             continue
-        lo["status"] = "limit_order_expired"
-        lo["expired_at"] = now.isoformat()
+
+        lo["expiry_cancel_attempted_at"] = now.isoformat()
+        symbol = (lo.get("symbol") or "").upper()
         order_id = str(lo.get("order_ticket") or "")
-        _log_execution_event(
-            trade_id=str(lo.get("client_id") or lo.get("id") or ""),
-            symbol=lo.get("symbol", ""),
-            direction=(lo.get("direction") or "").upper(),
-            planned_entry=lo.get("entry"),
-            status="bitunix_limit_expired", venue="bitunix",
-            bitunix_order_id=order_id,
-            reason="Bitunix limit order 24h window elapsed without fill",
-        )
-        send_telegram(
-            f"\u23f0 <b>Bitunix limit order EXPIRED</b>\n\n"
-            f"<b>{lo.get('symbol','')}</b> {(lo.get('direction') or '').upper()}\n"
-            f"Was waiting at: <b>{lo.get('entry')}</b>\n"
-            f"24h window elapsed without fill.\n"
-            f"Order: <code>{order_id}</code>\n\n"
-            f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
-        )
-        logging.info("Bitunix limit expired: %s %s order=%s",
-                     lo.get("symbol"), lo.get("direction"), order_id)
+        client_id = lo.get("client_id") or lo.get("id")
+        try:
+            resp = bitunix_cancel_order(symbol, order_id=order_id or None, client_id=client_id)
+            verified = _bitunix_cancel_confirmed(resp, order_id=order_id, client_id=client_id)
+        except Exception as e:
+            resp = {"error": str(e)}
+            verified = False
+
+        if verified:
+            lo["status"] = "bitunix_limit_expired_cancelled_verified"
+            lo["expired_at"] = now.isoformat()
+            lo["cancelled_at"] = now.isoformat()
+            _log_execution_event(
+                trade_id=str(client_id or ""),
+                symbol=symbol,
+                direction=(lo.get("direction") or "").upper(),
+                planned_entry=lo.get("entry"),
+                status="bitunix_limit_expired_cancelled", venue="bitunix",
+                bitunix_order_id=order_id,
+                reason="24h window elapsed — exchange cancel verified",
+            )
+            send_telegram(
+                f"\u23f0 <b>Bitunix limit order EXPIRED + CANCELLED</b>\n\n"
+                f"<b>{symbol}</b> {(lo.get('direction') or '').upper()}\n"
+                f"Was waiting at: <b>{lo.get('entry')}</b>\n"
+                f"24h window elapsed; Bitunix cancel was exchange-verified.\n"
+                f"Order: <code>{order_id}</code>\n\n"
+                f"\U0001f4dd <a href=\"{JOURNAL_URL}\">Open journal</a>"
+            )
+            logging.info("Bitunix expired limit cancelled: %s %s order=%s", symbol, lo.get("direction"), order_id)
+        else:
+            lo["expiry_cancel_failed_at"] = now.isoformat()
+            lo["expiry_cancel_result"] = resp
+            _log_execution_event(
+                trade_id=str(client_id or ""),
+                symbol=symbol,
+                direction=(lo.get("direction") or "").upper(),
+                planned_entry=lo.get("entry"),
+                status="bitunix_limit_expiry_cancel_failed", venue="bitunix",
+                bitunix_order_id=order_id,
+                reason="24h window elapsed — Bitunix cancel NOT verified; manual exchange check required",
+            )
+            send_telegram(
+                f"\u26a0\ufe0f <b>Bitunix limit order EXPIRED — CANCEL NOT VERIFIED</b>\n\n"
+                f"<b>{symbol}</b> {(lo.get('direction') or '').upper()}\n"
+                f"Was waiting at: <b>{lo.get('entry')}</b>\n"
+                f"24h window elapsed, but Bitunix did NOT confirm cancellation.\n"
+                f"Order: <code>{order_id}</code>\n\n"
+                f"Check/cancel this order manually on Bitunix."
+            )
+            logging.error("Bitunix expired limit cancel failed: %s order=%s resp=%s", symbol, order_id, resp)
 
 
 # ── Bitunix Flask Routes ───────────────────────────────
@@ -3451,14 +3486,14 @@ def bitunix_emergency_stop_get():
         "venue":      "bitunix",
         "emergency":  _bitunix_emergency_stop,
         "active":     _bitunix_emergency_stop,
-        "message":    ("Bitunix execution paused — kill switch active"
+        "message":    ("Bitunix new-order pause active"
                         if _bitunix_emergency_stop else "All clear — Bitunix executions enabled"),
     })
 
 
 @app.route("/api/bitunix/emergency-stop", methods=["POST"])
 def bitunix_emergency_stop_post():
-    """POST /api/bitunix/emergency-stop — set Bitunix kill switch."""
+    """POST /api/bitunix/emergency-stop — set/clear Bitunix new-order pause."""
     global _bitunix_emergency_stop
     auth_err = _require_execution_key()
     if auth_err:
@@ -3468,14 +3503,13 @@ def bitunix_emergency_stop_post():
     _bitunix_emergency_stop = activate
     if activate:
         send_telegram(
-            "\U0001f6a8 <b>Bitunix EMERGENCY STOP active!</b>\n\n"
-            "All new Bitunix executions blocked. "
-            "MT5 routing remains independent — flip its own kill switch separately if needed."
+            "⏸ <b>Bitunix new-order pause active</b>\n\n"
+            "New Bitunix executions are blocked. Existing Bitunix orders/positions are not cancelled by this control."
         )
-        logging.warning("Bitunix kill switch ACTIVATED via API")
+        logging.warning("Bitunix new-order pause ACTIVATED via API")
     else:
-        send_telegram("\u2705 <b>Bitunix kill switch cleared</b> — executions resumed.")
-        logging.info("Bitunix kill switch deactivated via API")
+        send_telegram("✅ <b>Bitunix new-order pause cleared</b> — executions resumed.")
+        logging.info("Bitunix new-order pause deactivated via API")
     return jsonify({"ok": True, "venue": "bitunix", "emergency": _bitunix_emergency_stop})
 
 
@@ -3995,12 +4029,13 @@ def trade_executed():
             logging.error("Failed to update journal via Gist: %s", e)
 
     if is_test:
+        test_status_text = ('Error: ' + err_text) if err_text else 'All steps passed ✅'
         msg = (
             f"\U0001f9ea <b>TEST trade pipeline OK</b>\n\n"
             f"Trade ID: <code>{trade_id}</code>\n"
             f"Symbol: {found['symbol']} {found['direction']}\n"
             f"Status: <b>{new_status}</b>\n"
-            f"{('Error: ' + err_text) if err_text else 'All steps passed \u2705'}"
+            f"{test_status_text}"
         )
     elif err_text:
         msg = (
@@ -4674,6 +4709,9 @@ def execution_health():
 
     # Queue
     pending = [t for t in _execution_queue if t.get("status") in ("approved", "pending", "fetched")]
+    mt5_pending_limits = [o for o in _pending_limit_orders if (o.get("venue", "mt5") == "mt5" and o.get("status") in ("limit_placed", "limit_order_cancel_requested"))]
+    bitunix_pending_limits = [o for o in _pending_limit_orders if (o.get("venue") == "bitunix" and o.get("status") in ("limit_placed", "bitunix_limit_placed"))]
+    mt5_cancel_backlog = [r for r in _mt5_cancel_requests if r.get("status") in ("pending", "delivered")]
 
     # Risk engine — green if EXECUTION_API_KEY is set (means risk pipeline is actually wired)
     risk_engine_ok = bool(EXECUTION_API_KEY)
@@ -4711,6 +4749,15 @@ def execution_health():
         },
         "telegram": {"ok": telegram_ok, "label": "Telegram configured" if telegram_ok else "Telegram missing"},
         "gist": {"ok": gist_ok, "label": "Gist token present" if gist_ok else "Gist token missing"},
+        "safety": {
+            "paper_mode": PAPER_TRADING_MODE,
+            "legacy_pause_active": _emergency_stop["active"] or _mt4_emergency_stop,
+            "mt5_pending_limits": len(mt5_pending_limits),
+            "bitunix_pending_limits": len(bitunix_pending_limits),
+            "mt5_cancel_backlog": len(mt5_cancel_backlog),
+            "bitunix_new_order_pause": _bitunix_emergency_stop,
+            "close_all_enabled": False,
+        },
         "emergency_stop": {
             "active": _emergency_stop["active"],
             "at": _emergency_stop["at"],
@@ -4722,11 +4769,11 @@ def execution_health():
 
 @app.route("/api/execution/emergency_stop", methods=["POST"])
 def execution_emergency_stop():
-    """POST /api/execution/emergency_stop — KILL SWITCH.
+    """POST /api/execution/emergency_stop — legacy queue pause.
 
-    Cancels every pending/approved trade in the queue, sets the emergency_stop flag
-    so the EA picks it up and closes all POIWatcher_-prefixed positions, and fires
-    a high-priority Telegram alert.
+    This endpoint only cancels unfetched backend queue items and sets a legacy
+    flag for visibility. It does not close existing broker/exchange positions.
+    The main UI no longer exposes this as an emergency control.
     """
     auth_err = _require_execution_key()
     if auth_err:
@@ -4754,11 +4801,11 @@ def execution_emergency_stop():
     _emergency_stop["by"] = by
 
     msg = (
-        f"\U0001f6d1 <b>EMERGENCY STOP ACTIVATED</b>\n\n"
-        f"\u2022 Cancelled <b>{cancelled}</b> pending trade(s)\n"
-        f"\u2022 EA instructed to close all POIWatcher positions\n"
-        f"\u2022 Triggered by: {by}\n\n"
-        f"\u26a0\ufe0f New approvals will still queue. Reset the kill switch in the journal when ready."
+        f"⏸ <b>Legacy execution queue pause activated</b>\n\n"
+        f"• Marked <b>{cancelled}</b> unfetched queue item(s) cancelled locally\n"
+        f"• Existing MT5/Bitunix broker-side orders/positions were NOT closed by this control\n"
+        f"• Triggered by: {by}\n\n"
+        f"Use per-order Cancel buttons for verified broker/exchange cancellation."
     )
     send_telegram(msg)
 
@@ -4769,6 +4816,24 @@ def execution_emergency_stop():
         "emergency_stop": _emergency_stop,
     })
 
+
+@app.route("/api/execution/emergency_stop", methods=["DELETE"])
+def execution_emergency_stop_clear():
+    """Clear stale legacy execution emergency-stop state.
+
+    This is intentionally a state clear only. It does not claim to close or
+    cancel broker/exchange-side orders.
+    """
+    global _mt4_emergency_stop
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    _mt4_emergency_stop = False
+    _emergency_stop["active"] = False
+    _emergency_stop["at"] = None
+    _emergency_stop["by"] = None
+    _log_execution_event(status="legacy_emergency_cleared", reason="Legacy emergency flag cleared by user")
+    return jsonify({"ok": True, "emergency_stop": _emergency_stop, "mt5_pause": False})
 
 @app.route("/api/mt4/emergency-stop", methods=["GET"])
 @app.route("/api/mt5/emergency-stop", methods=["GET"])
