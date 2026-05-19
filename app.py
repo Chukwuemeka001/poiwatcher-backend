@@ -3080,13 +3080,6 @@ def bitunix_trade_execute():
     if auth_err:
         return auth_err
 
-    if _bitunix_emergency_stop:
-        return jsonify({"error": "Bitunix emergency stop active"}), 403
-    if not BITUNIX_API_KEY:
-        return jsonify({"error": "Bitunix API not configured"}), 400
-    if _exchange_status["bitunix"]["disabled"]:
-        return jsonify({"error": _exchange_status["bitunix"]["error"], "disabled": True}), 403
-
     body = request.json or {}
     required = ["symbol", "direction", "entry", "sl", "tp"]
     for f in required:
@@ -3095,6 +3088,17 @@ def bitunix_trade_execute():
 
     symbol     = body["symbol"].upper()
     direction  = body["direction"].upper()
+    sl_error = _validate_required_stop_loss(body.get("entry"), body.get("sl"))
+    if sl_error:
+        return jsonify({"error": sl_error}), 400
+
+    if _bitunix_emergency_stop:
+        return jsonify({"error": "Bitunix emergency stop active"}), 403
+    if not BITUNIX_API_KEY:
+        return jsonify({"error": "Bitunix API not configured"}), 400
+    if _exchange_status["bitunix"].get("disabled"):
+        return jsonify({"error": _exchange_status["bitunix"].get("error"), "disabled": True}), 403
+
     entry      = float(body["entry"])
     sl         = float(body["sl"])
     tp         = float(body["tp"])
@@ -3554,6 +3558,20 @@ def _require_execution_key():
     return None
 
 
+def _validate_required_stop_loss(entry, sl):
+    """Return a safety error string when SL is missing or non-protective."""
+    try:
+        entry_f = float(entry)
+        sl_f = float(sl)
+    except (TypeError, ValueError):
+        return "Valid stop loss is required before execution"
+    if sl_f <= 0:
+        return "Stop loss must be greater than zero before execution"
+    if entry_f == sl_f:
+        return "Stop loss must be different from entry before execution"
+    return None
+
+
 def _get_account_state_from_gist():
     """Read closed trades from Gist to compute daily/weekly/monthly P&L."""
     trades_list = get_trades()
@@ -3749,6 +3767,13 @@ def approve_trade():
     for field in required:
         if field not in body:
             return jsonify({"error": f"Missing required field: {field}"}), 400
+
+    # Backend hard safety block: no execution-capable route may accept a
+    # missing, zero, or entry-equal stop loss. This runs before the risk engine
+    # and before the trade is queued/logged.
+    sl_error = _validate_required_stop_loss(body.get("entry"), body.get("sl"))
+    if sl_error:
+        return jsonify({"error": sl_error}), 400
 
     # Build trade object
     trade = {
@@ -4928,5 +4953,8 @@ if __name__ == "__main__":
     _start_background_threads()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 else:
-    # When run via gunicorn, also start background threads
-    _start_background_threads()
+    # When run via gunicorn, also start background threads.
+    # Unit tests set POIWATCHER_DISABLE_BACKGROUND_THREADS=1 so importing this
+    # module does not start monitor loops or make network calls.
+    if os.environ.get("POIWATCHER_DISABLE_BACKGROUND_THREADS", "").lower() not in {"1", "true", "yes"}:
+        _start_background_threads()
