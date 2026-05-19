@@ -91,6 +91,7 @@ string   executedTradeIDs[];
 datetime lastExecCheck      = 0;
 datetime lastEmergencyCheck = 0;
 datetime lastPendingCheck   = 0;   // 60-second pending-limit-order monitor
+datetime lastCancelRequestCheck = 0; // 10-second backend cancel-request poll
 string   lastEmergencyAt    = "";  // unused — kept for future kill-switch use
 bool     g_emergencyActive  = false; // true = backend said pause, skip new executions
 
@@ -226,6 +227,15 @@ void OnTimer()
    {
       lastEmergencyCheck = now;
       CheckForEmergencyStop();
+   }
+
+   // ── MT5 broker-side cancel request poll (always active — safety first) ──
+   // The journal/backend can request deletion of a pending MT5 limit order.
+   // This runs even during emergency pause because cancel must remain available.
+   if (now - lastCancelRequestCheck >= EmergencyCheckSeconds)
+   {
+      lastCancelRequestCheck = now;
+      CheckForCancelRequests();
    }
 
    // ── Pending limit order monitor ── (every 60 seconds)
@@ -1215,6 +1225,90 @@ void RemovePendingOrder(int idx)
    ArrayResize(pendingOrderPlacedAt,    last);
    ArrayResize(pendingOrderExpiresAt,   last);
    ArrayResize(pendingOrderIsPaper,     last);
+}
+
+//+------------------------------------------------------------------+
+//| Poll backend for cancel requests and delete matching MT5 orders  |
+//+------------------------------------------------------------------+
+void CheckForCancelRequests()
+{
+   if (StringLen(ExecutionAPIKey) == 0) return;
+
+   string response = HttpGetWithKey("/api/mt5/cancel-requests");
+   if (StringLen(response) == 0) return;
+   if (StringFind(response, "\"requests\"") < 0) return;
+
+   int pos = 0;
+   while (true)
+   {
+      int idKey = StringFind(response, "\"id\":\"", pos);
+      if (idKey < 0) break;
+      int objEnd = StringFind(response, "}", idKey);
+      if (objEnd < 0) break;
+      string reqJson = StringSubstr(response, idKey, objEnd - idKey + 1);
+
+      string tradeID = JsonGetString(reqJson, "id");
+      ulong ticket = (ulong)JsonGetDouble(reqJson, "order_ticket");
+      if (ticket == 0 || StringLen(tradeID) == 0)
+      {
+         pos = objEnd + 1;
+         continue;
+      }
+
+      int idx = -1;
+      for (int i = 0; i < ArraySize(pendingOrderTickets); i++)
+      {
+         if (pendingOrderTickets[i] == ticket || pendingOrderTradeIDs[i] == tradeID)
+         {
+            idx = i;
+            break;
+         }
+      }
+      if (idx < 0)
+      {
+         Print("POIWatcher: Cancel request not matched locally — trade=", tradeID,
+               " ticket=", IntegerToString((long)ticket));
+         pos = objEnd + 1;
+         continue;
+      }
+
+      string sym      = pendingOrderSymbols[idx];
+      string dir      = pendingOrderDirections[idx];
+      double limEntry = pendingOrderEntry[idx];
+      datetime expAt  = pendingOrderExpiresAt[idx];
+      ulong pTicket   = pendingOrderTickets[idx];
+
+      bool orderStillOpen = false;
+      int pending = OrdersTotal();
+      for (int o = pending - 1; o >= 0; o--)
+      {
+         ulong ot = OrderGetTicket(o);
+         if (ot == pTicket) { orderStillOpen = true; break; }
+      }
+
+      if (!orderStillOpen)
+      {
+         Print("POIWatcher: Cancel request found order already gone — #", pTicket);
+         SendLimitOrderExpiredOrCancelled(tradeID, pTicket, sym, dir, limEntry, expAt, "cancelled");
+         RemovePendingOrder(idx);
+         pos = objEnd + 1;
+         continue;
+      }
+
+      if (trade.OrderDelete(pTicket))
+      {
+         Print("POIWatcher: Cancel request deleted pending MT5 order — #", pTicket,
+               " trade=", tradeID);
+         SendLimitOrderExpiredOrCancelled(tradeID, pTicket, sym, dir, limEntry, expAt, "cancelled");
+         RemovePendingOrder(idx);
+      }
+      else
+      {
+         Print("POIWatcher: Cancel request FAILED for pending MT5 order #", pTicket,
+               " err=", GetLastError());
+      }
+      pos = objEnd + 1;
+   }
 }
 
 //+------------------------------------------------------------------+

@@ -3411,13 +3411,22 @@ def bitunix_trade_cancel():
         return jsonify({"error": "symbol and (order_id or client_id) required"}), 400
     try:
         resp = bitunix_cancel_order(symbol, order_id=order_id, client_id=client_id)
-        # Drop matching entry from pending-limits + log a cancellation event
+        verified = _bitunix_cancel_confirmed(resp, order_id=order_id, client_id=client_id)
+        if not verified:
+            return jsonify({
+                "ok": False,
+                "verified": False,
+                "error": "Bitunix cancellation not confirmed by exchange response",
+                "exchange_result": resp,
+            }), 502
+
+        # Only mark local state cancelled after exchange-side cancellation is verified.
         for lo in list(_pending_limit_orders):
             if (lo.get("venue") == "bitunix"
                 and (str(lo.get("order_ticket") or "") == str(order_id or "")
                      or str(lo.get("client_id") or "") == str(client_id or "")
                      or str(lo.get("id") or "") == str(client_id or ""))):
-                lo["status"] = "limit_order_cancelled"
+                lo["status"] = "bitunix_limit_cancelled_verified"
                 lo["cancelled_at"] = datetime.now(timezone.utc).isoformat()
                 break
         _log_execution_event(
@@ -3425,11 +3434,11 @@ def bitunix_trade_cancel():
             direction=(body.get("direction") or "").upper(),
             status="bitunix_cancelled", venue="bitunix",
             bitunix_order_id=str(order_id or ""),
-            reason="Bitunix order cancelled by user",
+            reason="Bitunix order cancelled by user — exchange verified",
         )
-        return jsonify({"ok": True, "result": resp.get("data")})
+        return jsonify({"ok": True, "verified": True, "result": resp.get("data"), "exchange_result": resp})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "verified": False}), 500
 
 
 @app.route("/api/bitunix/emergency-stop", methods=["GET"])
@@ -3509,6 +3518,11 @@ _emergency_stop = {"active": False, "at": None, "by": None}
 # When True the EA stops opening new trades but does NOT close existing positions.
 _mt4_emergency_stop = False
 
+# MT5 cancel requests — populated by journal/frontend cancel buttons and polled
+# by the EA. A request is not a verified cancellation until the EA deletes the
+# pending order and POSTs /api/trade/cancelled with reason=limit_order_cancelled.
+_mt5_cancel_requests = []
+
 
 def _log_execution_event(**kwargs):
     """Append an event to the execution log (most-recent first cap at MAX)."""
@@ -3570,6 +3584,38 @@ def _validate_required_stop_loss(entry, sl):
     if entry_f == sl_f:
         return "Stop loss must be different from entry before execution"
     return None
+
+
+def _bitunix_cancel_confirmed(resp, order_id=None, client_id=None):
+    """Best-effort classifier for Bitunix cancel API responses.
+
+    Local state is only marked cancelled when this returns True. Ambiguous or
+    failure-shaped responses stay unverified so the UI does not falsely claim an
+    exchange-side cancellation.
+    """
+    if not isinstance(resp, dict):
+        return False
+    code = resp.get("code")
+    success = resp.get("success")
+    if code not in (0, "0", None):
+        return False
+    if success is False:
+        return False
+    data = resp.get("data")
+    target_ids = {str(x) for x in (order_id, client_id) if x not in (None, "")}
+    if isinstance(data, dict):
+        failed = data.get("failureList") or data.get("failedList") or data.get("failList") or []
+        if failed:
+            return False
+        success_list = data.get("successList") or data.get("success_list") or data.get("orderList") or []
+        if success_list and target_ids:
+            for item in success_list:
+                if isinstance(item, dict):
+                    item_ids = {str(item.get(k)) for k in ("orderId", "clientId", "id") if item.get(k) not in (None, "")}
+                    if item_ids & target_ids:
+                        return True
+            return False
+    return code in (0, "0") or success is True
 
 
 def _get_account_state_from_gist():
@@ -3983,6 +4029,78 @@ def trade_executed():
     return jsonify({"ok": True, "trade": found})
 
 
+@app.route("/api/mt5/limit-order/cancel-request", methods=["POST"])
+def mt5_limit_order_cancel_request():
+    """Queue an MT5 pending-order cancel request for the EA to execute.
+
+    This does NOT claim the broker order is cancelled. Verification happens only
+    when the EA deletes the pending order and calls /api/trade/cancelled.
+    """
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+
+    body = request.json or {}
+    trade_id = body.get("id") or body.get("trade_id")
+    order_ticket = body.get("order_ticket")
+    if not trade_id and not order_ticket:
+        return jsonify({"error": "id or order_ticket required"}), 400
+
+    target = None
+    for lo in _pending_limit_orders:
+        if (str(lo.get("id") or "") == str(trade_id or "")
+            or str(lo.get("order_ticket") or "") == str(order_ticket or "")):
+            target = lo
+            break
+    if not target:
+        return jsonify({"error": "MT5 pending limit order not found in backend tracking"}), 404
+    if target.get("venue", "mt5") not in ("", "mt5"):
+        return jsonify({"error": "Order is not an MT5 pending order"}), 400
+
+    target["status"] = "limit_order_cancel_requested"
+    target["cancel_requested_at"] = datetime.now(timezone.utc).isoformat()
+    req = {
+        "id": target.get("id") or trade_id,
+        "order_ticket": target.get("order_ticket") or order_ticket,
+        "symbol": target.get("symbol", ""),
+        "direction": target.get("direction", ""),
+        "entry": target.get("entry"),
+        "status": "pending",
+        "requested_at": target["cancel_requested_at"],
+        "reason": body.get("reason") or "user_cancel",
+    }
+    _mt5_cancel_requests.append(req)
+    _log_execution_event(
+        trade_id=str(req["id"]), symbol=req.get("symbol", ""),
+        direction=req.get("direction", ""), planned_entry=req.get("entry"),
+        status="limit_order_cancel_requested", venue="mt5",
+        mt4_ticket=req.get("order_ticket"),
+        reason="MT5 cancel requested — awaiting EA OrderDelete confirmation",
+    )
+    send_telegram(
+        f"\u23f3 <b>MT5 limit cancel requested</b>\n\n"
+        f"<b>{req.get('symbol','')}</b> {req.get('direction','')}\n"
+        f"Ticket: <b>{req.get('order_ticket','')}</b>\n\n"
+        f"Waiting for EA to delete the pending order and confirm."
+    )
+    return jsonify({"ok": True, "verified": False, "request": req}), 202
+
+
+@app.route("/api/mt5/cancel-requests", methods=["GET"])
+@app.route("/api/mt4/cancel-requests", methods=["GET"])
+def mt5_cancel_requests_get():
+    """EA polls this for pending broker-side MT5 order deletions."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    pending = [r for r in _mt5_cancel_requests if r.get("status") == "pending"]
+    now = datetime.now(timezone.utc).isoformat()
+    for r in pending:
+        r["status"] = "delivered"
+        r["delivered_at"] = now
+    return jsonify({"requests": pending})
+
+
 @app.route("/api/trade/cancelled", methods=["POST"])
 def trade_cancelled():
     """POST /api/trade/cancelled — Cancel a pending trade or log a limit order expiry."""
@@ -4149,7 +4267,7 @@ def pending_orders():
     if auth_err:
         return auth_err
 
-    active = [o for o in _pending_limit_orders if o.get("status") == "limit_placed"]
+    active = [o for o in _pending_limit_orders if o.get("status") in ("limit_placed", "bitunix_limit_placed", "limit_order_cancel_requested")]
     now = datetime.now(timezone.utc)
 
     result = []
@@ -4173,6 +4291,8 @@ def pending_orders():
 
         result.append({
             "id":            o["id"],
+            "venue":         o.get("venue", "mt5"),
+            "client_id":     o.get("client_id"),
             "symbol":        o["symbol"],
             "direction":     o["direction"],
             "entry":         o["entry"],
