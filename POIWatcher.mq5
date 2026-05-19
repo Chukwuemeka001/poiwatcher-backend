@@ -44,7 +44,7 @@
 //+------------------------------------------------------------------+
 #property copyright "POIWatcher"
 #property link      "https://github.com/Chukwuemeka001/poiwatcher-backend"
-#property version   "2.00"
+#property version   "2.01"
 #property description "Auto-logger, Break-Even Bot and Trade Execution Pipeline for MT5"
 
 #include <Trade/Trade.mqh>
@@ -1823,6 +1823,8 @@ void SendHeartbeat()
    json += "\"open_trades\":"     + IntegerToString(openCount)                           + ",";
    json += "\"account_balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    json += "\"account_equity\":"  + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),  2) + ",";
+   json += "\"ea_version\":\"2.01\",";
+   json += "\"backend_url\":\""     + BackendURL + "\",";
    json += "\"timestamp\":\""     + TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)  + "\",";
    json += "\"platform\":\"mt5\"";
    json += "}";

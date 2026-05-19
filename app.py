@@ -42,6 +42,10 @@ EXECUTION_API_KEY = os.environ.get("EXECUTION_API_KEY", "")
 PAPER_TRADING_MODE = os.environ.get("PAPER_TRADING_MODE", "true").lower() != "false"
 GIST_ID = os.environ.get("GIST_ID", "bc004e07ada6586fc4492590f80b182b")
 GIST_FILE = "trade-journal.json"
+BACKEND_VERSION = os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("POIWATCHER_BACKEND_VERSION") or "local-dev"
+FRONTEND_EXPECTED_VERSION = os.environ.get("POIWATCHER_FRONTEND_VERSION", "unknown")
+MIN_EA_VERSION = os.environ.get("POIWATCHER_MIN_EA_VERSION", "2.01")
+BACKEND_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # ── Exchange API credentials ──
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
@@ -1529,6 +1533,8 @@ def mt4_status():
         _mt4_status["open_trades"] = body.get("open_trades", 0)
         _mt4_status["account_balance"] = body.get("account_balance", 0)
         _mt4_status["account_equity"] = body.get("account_equity", 0)
+        _mt4_status["ea_version"] = body.get("ea_version") or body.get("version") or _mt4_status.get("ea_version")
+        _mt4_status["backend_url"] = body.get("backend_url") or _mt4_status.get("backend_url")
 
         # Save connection status to Gist
         data = gist_read()
@@ -4683,6 +4689,21 @@ def bitunix_execution_test():
     }), 200
 
 
+@app.route("/api/version", methods=["GET"])
+def api_version():
+    """Return deployed backend/build expectations for live safety verification."""
+    return jsonify({
+        "ok": True,
+        "backend_version": BACKEND_VERSION,
+        "backend_started_at": BACKEND_STARTED_AT,
+        "paper_trading_mode": PAPER_TRADING_MODE,
+        "frontend_expected_version": FRONTEND_EXPECTED_VERSION,
+        "min_ea_version": MIN_EA_VERSION,
+        "ea_version": _mt4_status.get("ea_version"),
+        "ea_last_heartbeat": _mt4_status.get("last_heartbeat"),
+    })
+
+
 @app.route("/api/execution/health", methods=["GET"])
 def execution_health():
     """GET /api/execution/health — Aggregated status of all execution pipeline components."""
@@ -4723,7 +4744,7 @@ def execution_health():
     gist_ok = bool(GITHUB_GIST_TOKEN)
 
     return jsonify({
-        "backend": {"ok": backend_ok, "label": "Backend reachable"},
+        "backend": {"ok": backend_ok, "label": "Backend reachable", "version": BACKEND_VERSION, "started_at": BACKEND_STARTED_AT},
         "mt4": {
             "ok": mt4_ok,
             "label": "MT5 EA connected" if mt4_ok else "MT5 EA offline",
@@ -4731,6 +4752,9 @@ def execution_health():
             "age_seconds": mt4_age_seconds,
             "open_trades": _mt4_status.get("open_trades", 0),
             "account_equity": _mt4_status.get("account_equity", 0),
+            "ea_version": _mt4_status.get("ea_version"),
+            "min_ea_version": MIN_EA_VERSION,
+            "backend_url": _mt4_status.get("backend_url"),
         },
         "queue": {
             "ok": True,
@@ -4751,6 +4775,10 @@ def execution_health():
         "gist": {"ok": gist_ok, "label": "Gist token present" if gist_ok else "Gist token missing"},
         "safety": {
             "paper_mode": PAPER_TRADING_MODE,
+            "backend_version": BACKEND_VERSION,
+            "frontend_expected_version": FRONTEND_EXPECTED_VERSION,
+            "ea_version": _mt4_status.get("ea_version"),
+            "min_ea_version": MIN_EA_VERSION,
             "legacy_pause_active": _emergency_stop["active"] or _mt4_emergency_stop,
             "mt5_pending_limits": len(mt5_pending_limits),
             "bitunix_pending_limits": len(bitunix_pending_limits),
