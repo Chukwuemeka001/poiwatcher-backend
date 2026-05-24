@@ -42,6 +42,7 @@ EXECUTION_API_KEY = os.environ.get("EXECUTION_API_KEY", "")
 PAPER_TRADING_MODE = os.environ.get("PAPER_TRADING_MODE", "true").lower() != "false"
 GIST_ID = os.environ.get("GIST_ID", "bc004e07ada6586fc4492590f80b182b")
 GIST_FILE = "trade-journal.json"
+NCLEX_EXTERNAL_REVIEWS_GIST_FILE = os.environ.get("NCLEX_EXTERNAL_REVIEWS_GIST_FILE", "nclex-external-reviews.json")
 BACKEND_VERSION = os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("POIWATCHER_BACKEND_VERSION") or "local-dev"
 FRONTEND_EXPECTED_VERSION = os.environ.get("POIWATCHER_FRONTEND_VERSION", "unknown")
 MIN_EA_VERSION = os.environ.get("POIWATCHER_MIN_EA_VERSION", "2.01")
@@ -216,6 +217,118 @@ def gist_write(data):
         _last_gist_error = f"{type(e).__name__}: {e}"
         logging.error("Gist write failed: %s", _last_gist_error)
         return False
+
+
+def gist_file_read_json(file_name, default=None):
+    """Read a JSON file from the configured private Gist."""
+    if default is None:
+        default = {}
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=15)
+        r.raise_for_status()
+        file_info = r.json().get("files", {}).get(file_name)
+        if not file_info:
+            return default
+        content = file_info.get("content") or ""
+        return json.loads(content) if content.strip() else default
+    except Exception as e:
+        logging.error("Gist file read failed for %s: %s", file_name, e)
+        return default
+
+
+def gist_file_write_json(file_name, data):
+    """Write one JSON file to the configured private Gist without touching other files."""
+    global _last_gist_error
+    if not GITHUB_GIST_TOKEN:
+        _last_gist_error = "GITHUB_GIST_TOKEN not set on Render env vars"
+        logging.error("Gist file write skipped: %s", _last_gist_error)
+        return False
+    if not GIST_ID:
+        _last_gist_error = "GIST_ID not set on Render env vars"
+        return False
+    try:
+        payload = {"files": {file_name: {"content": json.dumps(data, indent=2, sort_keys=True)}}}
+        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), json=payload, timeout=15)
+        if not r.ok:
+            _last_gist_error = f"HTTP {r.status_code}: {(r.text or '')[:200]}"
+            logging.error("Gist file write failed for %s: %s", file_name, _last_gist_error)
+            return False
+        _last_gist_error = None
+        return True
+    except Exception as e:
+        _last_gist_error = f"{type(e).__name__}: {e}"
+        logging.error("Gist file write failed for %s: %s", file_name, _last_gist_error)
+        return False
+
+
+def _nclex_review_submissions_from_payload(body):
+    if not isinstance(body, dict):
+        raise ValueError("JSON object required")
+    schema = body.get("schemaVersion")
+    if schema == "external-review-batch.v1":
+        submissions = body.get("submissions")
+        if not isinstance(submissions, list) or not submissions:
+            raise ValueError("Batch contains no review submissions")
+        if len(submissions) > 50:
+            raise ValueError("Batch limit is 50 submissions")
+        return submissions
+    if schema == "external-review-submission.v1" or body.get("questionId") or body.get("response"):
+        return [body]
+    raise ValueError("Unsupported external review payload")
+
+
+def _sanitize_nclex_review_submission(submission):
+    if not isinstance(submission, dict):
+        raise ValueError("Each submission must be an object")
+    question_id = submission.get("questionId") or (submission.get("itemSnapshot") or {}).get("id")
+    if not question_id:
+        raise ValueError("questionId required")
+    reviewer = submission.get("reviewer") or {}
+    response = submission.get("response") or {}
+    return {
+        "id": str(uuid.uuid4()),
+        "receivedAt": datetime.now(timezone.utc).isoformat(),
+        "source": "nclex_public_reviewer",
+        "questionId": str(question_id),
+        "reviewer": {
+            "key": str(reviewer.get("key") or response.get("reviewerKey") or "unknown")[:80],
+            "name": str(reviewer.get("name") or response.get("reviewerName") or "unknown")[:120],
+            "role": str(reviewer.get("role") or response.get("reviewerRole") or "")[:200],
+        },
+        "decision": str(submission.get("decision") or response.get("decision") or "")[:40],
+        "payload": submission,
+    }
+
+
+def nclex_external_reviews_read():
+    data = gist_file_read_json(NCLEX_EXTERNAL_REVIEWS_GIST_FILE, default={})
+    if not isinstance(data, dict):
+        data = {}
+    submissions = data.get("submissions")
+    if not isinstance(submissions, list):
+        submissions = []
+    return {
+        "schemaVersion": "nclex-external-reviews-log.v1",
+        "submissions": submissions,
+        "updatedAt": data.get("updatedAt"),
+    }
+
+
+def nclex_external_reviews_append(body):
+    submissions = [_sanitize_nclex_review_submission(s) for s in _nclex_review_submissions_from_payload(body)]
+    log_data = nclex_external_reviews_read()
+    existing = log_data["submissions"]
+    existing.extend(submissions)
+    if len(existing) > 500:
+        existing = existing[-500:]
+    log_data = {
+        "schemaVersion": "nclex-external-reviews-log.v1",
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "submissions": existing,
+    }
+    if not gist_file_write_json(NCLEX_EXTERNAL_REVIEWS_GIST_FILE, log_data):
+        raise RuntimeError(_last_gist_error or "Gist write failed")
+    return submissions
 
 
 def get_alerts():
@@ -717,6 +830,43 @@ def health():
         "uptime_seconds":            int(time.time() - _app_start_time),
         "position_monitor_last_run": _position_monitor_last_run,
         "alert_monitor_last_run":    _alert_monitor_last_run,
+    })
+
+
+@app.route("/api/nclex/external-reviews", methods=["POST"])
+def nclex_external_reviews_post():
+    """Public reviewer intake for NCLEX calibration feedback.
+
+    This intentionally does not require X-Execution-Key because Alexis/Ihechi
+    submit from a public static GitHub Pages form. It only appends review JSON
+    to a separate private Gist file and never touches execution/trading state.
+    """
+    body = request.get_json(silent=True)
+    try:
+        saved = nclex_external_reviews_append(body)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logging.error("NCLEX external review save failed: %s", e)
+        return jsonify({"ok": False, "error": "review save failed", "detail": str(e)[:200]}), 503
+    return jsonify({
+        "ok": True,
+        "savedCount": len(saved),
+        "saved": [{"id": s["id"], "questionId": s["questionId"], "reviewer": s["reviewer"].get("key"), "receivedAt": s["receivedAt"]} for s in saved],
+    })
+
+
+@app.route("/api/nclex/external-reviews", methods=["GET"])
+def nclex_external_reviews_get():
+    """Protected admin export for Hermes/Emeka to inspect submitted reviews."""
+    auth_err = _require_execution_key()
+    if auth_err:
+        return auth_err
+    log_data = nclex_external_reviews_read()
+    return jsonify({
+        "ok": True,
+        "count": len(log_data.get("submissions", [])),
+        **log_data,
     })
 
 
