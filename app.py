@@ -73,7 +73,9 @@ POLL_INTERVAL = 60   # seconds — reduced from 30 to avoid rate limits
 RETRY_INTERVAL = 60  # seconds on API failure
 CACHE_TTL = 45       # seconds — serve cached price if fresher than this
 
-# ── Trading system document (embedded for AI prompt) ───
+# ── Trading system document (embedded fallback for AI prompt) ───
+# NOTE: Runtime source of truth is TradingSystem_MasterSpec.md loaded via
+# _get_trading_framework_text(). This embedded text is a fallback only.
 TRADING_SYSTEM = r"""
 BTCUSDT Trading System — Personal Framework & Rules
 Version 2.0
@@ -164,6 +166,25 @@ mbms = Minor Break in Market Structure | Primary POI = mbms area (deepest pullba
 Secondary POI = First liquidity zone directly after BOS | SC = Sponsored Candle (grey zone)
 Trusted BOS = BOS after primary POI properly mitigated | HTF = Higher timeframe | LTF = Lower timeframe
 """
+
+MASTER_SPEC_PATH = os.environ.get(
+    "TRADING_SYSTEM_MASTERSPEC_PATH",
+    "/Users/emeka/liquidity-inducement-trader/docs/TradingSystem_MasterSpec.md",
+)
+
+
+def _get_trading_framework_text() -> str:
+    """Load latest trading framework from MasterSpec; fallback to embedded text."""
+    try:
+        p = MASTER_SPEC_PATH
+        if p and os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                return text
+    except Exception as e:
+        logging.warning("MasterSpec load failed (%s). Falling back to embedded framework.", e)
+    return TRADING_SYSTEM.strip()
 
 # ── Gist helpers ────────────────────────────────────────
 
@@ -1076,39 +1097,34 @@ def ai_levels():
         ohlcv_text += f"{c['time']} | {c['open']:.2f} | {c['high']:.2f} | {c['low']:.2f} | {c['close']:.2f} | {c['volume']:.0f}\n"
 
     # 3. Send to Claude
+    framework_text = _get_trading_framework_text()
     system_prompt = f"""You are analyzing price action for a trader who uses the following framework:
 
-{TRADING_SYSTEM}
+{framework_text}
 
-Analyze the provided OHLCV candle data and identify key levels using ONLY the concepts from this framework:
+Use this strict 4-item alignment lens while identifying levels and context:
+1) Tradeable BOS must originate from a previously respected zone (PRI POI or prior 70–99.9% zone).
+2) Liquidity must be swept before entry/continuation.
+3) Entry context must be inside the 70–99.9% retracement zone (not at 100%).
+4) Reject weak-continuation HL/LH structures that form too shallow near BOS and are likely liquidity traps.
 
-- BOS levels (significant highs/lows that were broken)
-- MBOS levels (major breaks built on validated structure)
-- $$ liquidity zones (first low/high after each BOS)
-- mbms areas (minor structure breaks telegraphing bigger BOS)
-- Primary POI zones (below/above mbms)
-- SC zones (last prominent candle before significant moves)
+Output only the most decision-useful levels and context needed for this 4-item lens:
+- level type (BOS / Tradeable BOS candidate / Liquidity / 70-99.9 zone / PRI POI / SC zone)
+- price level
+- significance (High / Medium / Low)
+- concise reasoning in trader vocabulary, explicitly tied to the 4-item lens
 
-For each level identified return:
-- Level type (BOS / MBOS / $$ Secondary / $$ Primary / mbms / Primary POI / SC Zone)
-- Price level (exact number)
-- Significance (High / Medium / Low)
-- Brief reasoning in the trader's own lingo
-
-Return ONLY a JSON array. No prose. No explanation outside the JSON. Format:
+Return ONLY a JSON array. No prose outside JSON. Format:
 [
   {{
-    "type": "BOS",
+    "type": "Tradeable BOS candidate",
     "price": 70000,
     "significance": "High",
-    "reasoning": "Major structural break after higher high at 125k, first significant low formed here becomes $$ secondary"
+    "reasoning": "Closed above prior swing after liquidity sweep; origin overlaps previously respected 70-99.9 zone"
   }}
 ]
 
-Use the trader's exact terminology throughout.
-Maximum 8-10 levels per analysis.
-Focus on the most significant levels only.
-Do not identify noise — only what matters."""
+Maximum 8-10 levels. Focus on high-signal structure only."""
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
